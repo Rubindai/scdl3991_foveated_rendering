@@ -17,14 +17,14 @@ import pyluxcore  # pip install pyluxcore (WSL conda env)
 from typing import Optional, Dict
 
 from logging_utils import get_logger
+from scdl_config import env_path, get_pipeline_paths
 
 # =========== CONFIG (edit) ===========
-_env_dir = os.environ.get("SCDL_PROJECT_DIR")
-PROJECT_DIR = Path(_env_dir).resolve() if _env_dir else Path(__file__).resolve().parent
-EXPORT_DIR = PROJECT_DIR / "export"     # from Blender FileSaver
-OUT_DIR = PROJECT_DIR / "out"
-OUT_DIR.mkdir(parents=True, exist_ok=True)
-LOGGER = get_logger("scdl_step4_render", OUT_DIR / "scdl_pipeline.log")
+PATHS = get_pipeline_paths(Path(__file__).resolve().parent)
+PROJECT_DIR = PATHS.project_dir
+EXPORT_DIR = PATHS.export_dir     # from Blender FileSaver
+OUT_DIR = PATHS.out_dir
+LOGGER = get_logger("scdl_step4_render", PATHS.log_file)
 
 
 def log_info(msg: str):
@@ -39,18 +39,17 @@ def log_error(msg: str):
     LOGGER.error(msg)
 
 # Allow overriding the config path (prefer the exact path produced by FileSaver)
-ENV_CFG = os.environ.get("SCDL_CFG_PATH")
-CFG_PATH = Path(ENV_CFG).resolve() if ENV_CFG else (EXPORT_DIR / "render.cfg")
+CFG_PATH = env_path("SCDL_CFG_PATH", EXPORT_DIR / "render.cfg", base=PROJECT_DIR)
 
 # Precomputed DINO mask path (produced by step2_dino_mask.py)
-MASK_NPY = OUT_DIR / "user_importance.npy"
-PREVIEW_PATH = OUT_DIR / "preview.png"
+MASK_NPY = PATHS.mask_npy
+PREVIEW_PATH = PATHS.preview
 
 # Final render (defaults; can be overridden by CLI/env)
 FINAL_W = int(os.environ.get("SCDL_FINAL_W", "1024"))
 FINAL_H = int(os.environ.get("SCDL_FINAL_H", "1024"))
 FINAL_HALTSPS = int(os.environ.get("SCDL_HALTSPS", "1200"))
-FINAL_PATH = OUT_DIR / "final.png"
+FINAL_PATH = PATHS.final
 
 # Adaptive noise estimation cadence
 NOISE_WARMUP_SPP = int(os.environ.get("SCDL_NOISE_WARMUP", "32"))

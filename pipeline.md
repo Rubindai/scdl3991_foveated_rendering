@@ -15,6 +15,7 @@ Pipeline (matches the numbered callouts in the diagram):
 - Run in Blender (Windows). Uses the ROI bbox to selectively re-render masked regions at higher quality and composites those patches over a modest base render.
 - Output: `out/final.png`.
 - Script: `step3_blender_roi_compose.py`.
+- Tweak ROI and fill quality via `SCDL_ROI_*` and `SCDL_BASE_CYCLES_*` in `.scdl.env`.
 
 Optional: LuxCore single-pass final (WSL).
 - Instead of step 3 in Blender, export LuxCore SDL and do a single LuxCore render that consumes the per-pixel importance map (when supported by the build).

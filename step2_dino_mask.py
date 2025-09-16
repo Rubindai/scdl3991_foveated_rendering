@@ -14,27 +14,26 @@ import torch.nn.functional as F
 from torchvision import transforms
 
 from logging_utils import get_logger
+from scdl_config import env_path, get_pipeline_paths
 
 
 # =========== CONFIG (edit) ===========
-_env_dir = os.environ.get("SCDL_PROJECT_DIR")
-PROJECT_DIR = Path(_env_dir).resolve() if _env_dir else Path(
-    __file__).resolve().parent
-OUT_DIR = PROJECT_DIR / "out"
-OUT_DIR.mkdir(parents=True, exist_ok=True)
-PREVIEW_PATH = OUT_DIR / "preview.png"
+PATHS = get_pipeline_paths(Path(__file__).resolve().parent)
+PROJECT_DIR = PATHS.project_dir
+OUT_DIR = PATHS.out_dir
+PREVIEW_PATH = PATHS.preview
 
 # DINOv3 (local clone + weights)
-REPO_DIR = Path(os.environ.get("SCDL_DINO_REPO",
-                str(PROJECT_DIR / "dinov3"))).resolve()
-WEIGHT_PATH = Path(os.environ.get("SCDL_DINO_WEIGHTS", str(
-    PROJECT_DIR / "dinov3_vits16_pretrain_lvd1689m-08c60483.pth"))).resolve()
+REPO_DIR = env_path("SCDL_DINO_REPO", PROJECT_DIR / "dinov3", base=PROJECT_DIR)
+WEIGHT_PATH = env_path("SCDL_DINO_WEIGHTS",
+                      PROJECT_DIR / "dinov3_vits16_pretrain_lvd1689m-08c60483.pth",
+                      base=PROJECT_DIR)
 
 # Outputs
-MASK_NPY = OUT_DIR / "user_importance.npy"
-MASK_PREVIEW = OUT_DIR / "user_importance_preview.png"
-ROI_BBOX_TXT = OUT_DIR / "roi_bbox.txt"
-LOGGER = get_logger("scdl_step2", OUT_DIR / "scdl_pipeline.log")
+MASK_NPY = PATHS.mask_npy
+MASK_PREVIEW = PATHS.mask_preview
+ROI_BBOX_TXT = PATHS.roi_bbox
+LOGGER = get_logger("scdl_step2", PATHS.log_file)
 
 
 def log_info(msg: str):

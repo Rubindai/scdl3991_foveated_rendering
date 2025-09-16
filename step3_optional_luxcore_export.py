@@ -9,12 +9,13 @@ import addon_utils
 from pathlib import Path
 
 from logging_utils import get_logger
+from scdl_config import get_pipeline_paths
 
-REPO_ROOT = Path(__file__).resolve().parent
+PATHS = get_pipeline_paths(Path(__file__).resolve().parent)
+REPO_ROOT = PATHS.project_dir
 BLEND_DIR = Path(bpy.path.abspath("//")).resolve()
-EXPORT_DIR = (REPO_ROOT / "export").resolve()
-LOG_PATH = (REPO_ROOT / "out" / "scdl_pipeline.log").resolve()
-LOGGER = get_logger("scdl_step3_export", LOG_PATH)
+EXPORT_DIR = PATHS.export_dir
+LOGGER = get_logger("scdl_step3_export", PATHS.log_file)
 
 
 def log_info(msg: str):
