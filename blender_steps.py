@@ -142,45 +142,6 @@ def log_error(msg: str):
     LOGGER.error(msg)
 
 
-def _set_luxcore_halting(scene, spp=800, time_s=120, noise_threshold=0.05):
-    try:
-        lc = getattr(scene, 'luxcore', None)
-        halt = getattr(lc, 'halt', None) if lc else None
-        if halt is None:
-            return
-        halt.enable = True
-        # samples (eye only)
-        if spp:
-            halt.use_samples = True
-            halt.samples = int(max(2, spp))
-        else:
-            halt.use_samples = False
-        # time
-        if time_s:
-            halt.use_time = True
-            halt.time = int(max(1, time_s))
-        else:
-            halt.use_time = False
-        # noise threshold (0..255 integer scale in some builds)
-        if noise_threshold is not None:
-            v = noise_threshold
-            if isinstance(v, float) and v <= 1.0:
-                v = int(max(0, min(255, round(v * 256))))
-            else:
-                v = int(max(0, min(255, v)))
-            halt.use_noise_thresh = True
-            halt.noise_thresh = v
-            try:
-                halt.noise_thresh_warmup = max(16, min(256, halt.noise_thresh_warmup))
-                halt.noise_thresh_step = max(16, min(256, halt.noise_thresh_step))
-            except Exception:
-                pass
-        else:
-            halt.use_noise_thresh = False
-    except Exception:
-        pass
-
-
 # =====================
 # Step 1: Preview render
 # =====================
@@ -264,23 +225,14 @@ def render_roi_and_compose():
     nx0 = max(0.0, min(1.0, nx0)); nx1 = max(0.0, min(1.0, nx1))
     ny0 = max(0.0, min(1.0, ny0)); ny1 = max(0.0, min(1.0, ny1))
 
-    # Pick engine: prefer LuxCore; fallback to Cycles
-    engines = set(_enum_engines())
-    use_lux = False
-    if 'LUXCORE' in engines:
-        try:
-            scene.render.engine = 'LUXCORE'
-            use_lux = True
-        except Exception:
-            use_lux = False
-    if not use_lux:
-        try:
-            _ensure_cycles_addon()
-            scene.render.engine = 'CYCLES'
-            _configure_cycles_device(scene)
-        except Exception as exc:
-            log_error(f"[Engine] Fallback to Cycles failed: {exc}")
-            raise
+    # Force Cycles for ROI re-render; LuxCore offers no benefit without per-pixel SPP control
+    try:
+        _ensure_cycles_addon()
+        scene.render.engine = 'CYCLES'
+        _configure_cycles_device(scene)
+    except Exception as exc:
+        log_error(f"[Engine] Could not configure Cycles for ROI render: {exc}")
+        raise
 
     # Compute aspect-preserving placement of preview inside render frame
     rw, rh = int(scene.render.resolution_x), int(scene.render.resolution_y)
@@ -314,43 +266,36 @@ def render_roi_and_compose():
     scene.render.border_max_y = 1.0 - fny0
     scene.render.film_transparent = True
 
-    # Halting
-    if use_lux:
-        spp = int(os.environ.get("SCDL_ROI_LUX_SPP", "800"))
-        time_s = int(os.environ.get("SCDL_ROI_LUX_TIME", "120"))
-        noise = float(os.environ.get("SCDL_ROI_LUX_NOISE", "0.06"))
-        _set_luxcore_halting(scene, spp=spp, time_s=time_s, noise_threshold=noise)
-    else:
-        try:
-            scene.cycles.samples = int(os.environ.get("SCDL_ROI_CYCLES_SPP", "512"))
-            scene.cycles.use_adaptive_sampling = bool(int(os.environ.get("SCDL_ROI_CYCLES_ADAPTIVE", "1")))
-            scene.cycles.adaptive_threshold = float(os.environ.get("SCDL_ROI_CYCLES_THRESHOLD", "0.05"))
-            # Enable denoising for ROI
-            for vl in scene.view_layers:
-                try:
-                    vl.cycles.use_denoising = True
-                except Exception:
-                    pass
-        except Exception:
-            pass
+    # Configure ROI sampling budget for Cycles
+    try:
+        scene.cycles.samples = int(os.environ.get("SCDL_ROI_CYCLES_SPP", "512"))
+        scene.cycles.use_adaptive_sampling = bool(int(os.environ.get("SCDL_ROI_CYCLES_ADAPTIVE", "1")))
+        scene.cycles.adaptive_threshold = float(os.environ.get("SCDL_ROI_CYCLES_THRESHOLD", "0.05"))
+        # Enable denoising for ROI
+        for vl in scene.view_layers:
+            try:
+                vl.cycles.use_denoising = True
+            except Exception:
+                pass
+    except Exception:
+        pass
 
     # 1) Render a quick full-frame base as background to avoid "unrendered" look
     scene.render.use_border = False
     scene.render.film_transparent = False
-    if not use_lux:
-        try:
-            # Modest base samples; denoise on
-            base_spp = int(os.environ.get("SCDL_BASE_CYCLES_SPP", "128"))
-            scene.cycles.samples = base_spp
-            scene.cycles.use_adaptive_sampling = True
-            scene.cycles.adaptive_threshold = float(os.environ.get("SCDL_BASE_CYCLES_THRESHOLD", "0.08"))
-            for vl in scene.view_layers:
-                try:
-                    vl.cycles.use_denoising = True
-                except Exception:
-                    pass
-        except Exception:
-            pass
+    try:
+        # Modest base samples; denoise on
+        base_spp = int(os.environ.get("SCDL_BASE_CYCLES_SPP", "128"))
+        scene.cycles.samples = base_spp
+        scene.cycles.use_adaptive_sampling = True
+        scene.cycles.adaptive_threshold = float(os.environ.get("SCDL_BASE_CYCLES_THRESHOLD", "0.08"))
+        for vl in scene.view_layers:
+            try:
+                vl.cycles.use_denoising = True
+            except Exception:
+                pass
+    except Exception:
+        pass
     scene.render.image_settings.file_format = 'PNG'
     scene.render.filepath = str(base_path)
     bpy.ops.render.render(write_still=True)
