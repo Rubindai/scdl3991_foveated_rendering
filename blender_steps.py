@@ -225,7 +225,7 @@ def render_roi_and_compose():
     nx0 = max(0.0, min(1.0, nx0)); nx1 = max(0.0, min(1.0, nx1))
     ny0 = max(0.0, min(1.0, ny0)); ny1 = max(0.0, min(1.0, ny1))
 
-    # Force Cycles for ROI re-render; LuxCore offers no benefit without per-pixel SPP control
+    # Force Cycles for ROI re-render to match the composite pipeline expectations
     try:
         _ensure_cycles_addon()
         scene.render.engine = 'CYCLES'

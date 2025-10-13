@@ -22,8 +22,5 @@ Pipeline (matches the numbered callouts in the diagram):
 - Output: `out/final.png`.
 - Script: `step3_blender_roi_compose.py`.
 
-Optional branch: LuxCore export & WSL render
-- Replaces the Blender composite with a LuxCore FileSaver export and an optional WSL final render when `SCDL_USE_WSL_FINAL=1` (set `SCDL_FORCE_LUXCORE_EXPORT=1` to export without rendering).
-- Step 3 (export) inputs: scene `.blend`, BlendLuxCore add-on, mask artifacts if referenced by the export script. Outputs: `export/render.cfg`, `export/scene.scn`.
-- Step 4 (WSL render) inputs: exported SDL files, `out/user_importance.npy`, LuxCore configuration/overrides. Output: `out/final.png` (only when the WSL render runs).
-- Scripts: `step3_optional_luxcore_export.py` (Windows Blender) and `step4_optional_luxcore_render.py` (WSL).
+Artifacts produced along the way:
+- `out/preview.png`, `out/user_importance.npy`, `out/user_importance_preview.png`, `out/mask_overlay.png`, `out/roi_bbox.txt`, and the final `out/final.png`.

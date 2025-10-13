@@ -15,7 +15,6 @@ class PipelinePaths:
 
     project_dir: Path
     out_dir: Path
-    export_dir: Path
     preview: Path
     final: Path
     mask_npy: Path
@@ -45,9 +44,7 @@ def get_pipeline_paths(default_root: Optional[Path] = None) -> PipelinePaths:
 
     project_dir = _resolve_project_dir(default_root)
     out_dir = project_dir / "out"
-    export_dir = project_dir / "export"
     out_dir.mkdir(parents=True, exist_ok=True)
-    export_dir.mkdir(parents=True, exist_ok=True)
     preview = out_dir / "preview.png"
     final = out_dir / "final.png"
     mask_npy = out_dir / "user_importance.npy"
@@ -57,7 +54,6 @@ def get_pipeline_paths(default_root: Optional[Path] = None) -> PipelinePaths:
     return PipelinePaths(
         project_dir=project_dir,
         out_dir=out_dir,
-        export_dir=export_dir,
         preview=preview,
         final=final,
         mask_npy=mask_npy,

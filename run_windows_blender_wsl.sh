@@ -130,7 +130,7 @@ filter_blender_output() {
       Saved:*)
         log_info "$stripped"
         ;;
-      BlendLuxCore*|Updating\ device\ list|Created\ history\ step*|Blender\ *|Read\ blend:*|Time:*Saving:*)
+      Updating\ device\ list|Created\ history\ step*|Blender\ *|Read\ blend:*|Time:*Saving:*)
         log_info "$stripped"
         ;;
       Fra:*)
@@ -175,61 +175,18 @@ BLENDER_EXE="${BLENDER_EXE:-/mnt/d/Programs/blender/blender.exe}"
 BLEND_FILE="${1:-${BLEND_FILE:-blender_files/cookie.blend}}"
 PREVIEW_SCRIPT="step1_preview_blender.py"              # renders out/preview.png next to the .blend
 FINAL_SCRIPT="step3_blender_roi_compose.py"            # ROI + composite to out/final.png
-EXPORT_SCRIPT="step3_optional_luxcore_export.py"       # exports render.cfg + scene.scn to ./export
-WSL_RENDER_SCRIPT="step4_optional_luxcore_render.py"  # optional LuxCore final in WSL
 WSL_DINO_SCRIPT="step2_dino_mask.py"
 
-# Optional: conda env for the WSL render script
-if [ -z "${CONDA_EXE:-}" ]; then
-  if command -v conda >/dev/null 2>&1; then
-    CONDA_EXE="$(command -v conda)"
-  elif [ -x "$HOME/miniconda3/bin/conda" ]; then
-    CONDA_EXE="$HOME/miniconda3/bin/conda"
-  elif [ -x "$HOME/anaconda3/bin/conda" ]; then
-    CONDA_EXE="$HOME/anaconda3/bin/conda"
-  else
-    CONDA_EXE=""
-  fi
-fi
-if [ -n "$CONDA_EXE" ]; then
-  log_info "Using conda executable: $CONDA_EXE"
-else
-  log_info "CONDA_EXE not set; will rely on system Python for WSL steps."
-fi
-CONDA_ENV="${CONDA_ENV:-base}"   # must have torch, timm, pyluxcore, imageio, numpy
 # ========================
 
 # Preflight checks
 command -v wslpath >/dev/null 2>&1 || die "wslpath not found. Run under WSL."
 [ -f "$BLEND_FILE" ] || die "Blend file not found: $BLEND_FILE"
-[ -f "$EXPORT_SCRIPT" ] || die "Exporter script missing: $EXPORT_SCRIPT"
-[ -f "$WSL_RENDER_SCRIPT" ] || die "WSL render script missing: $WSL_RENDER_SCRIPT"
 [ -f "$WSL_DINO_SCRIPT" ] || die "WSL DINO script missing: $WSL_DINO_SCRIPT"
 [ -f "$BLENDER_EXE" ] || die "Blender.exe not found at $BLENDER_EXE. Set BLENDER_EXE=/mnt/<drive>/path/to/blender.exe"
 
-# ----- Determine which stages will run (aligns with pipeline.md) -----
-use_wsl_final=0
-if [ "${SCDL_USE_WSL_FINAL:-0}" = "1" ]; then
-  use_wsl_final=1
-fi
-force_export=0
-if [ "${SCDL_FORCE_LUXCORE_EXPORT:-0}" = "1" ]; then
-  force_export=1
-fi
-
-# Stage selection mirrors pipeline.md: 1) preview, 2) DINO mask.
-# Optional branches: LuxCore export (for either forced export or WSL final) and a final render via
-# LuxCore (WSL) or Blender ROI compose (Windows).
-SHOULD_EXPORT=0
-if [ "$use_wsl_final" -eq 1 ] || [ "$force_export" -eq 1 ]; then
-  SHOULD_EXPORT=1
-fi
-
-# Base stage count matches the documented pipeline steps (preview, DINO, final/export).
+# Base stage count matches the documented pipeline steps (preview, DINO, final composite).
 TOTAL_STEPS=3
-if [ "$use_wsl_final" -eq 1 ]; then
-  TOTAL_STEPS=$((TOTAL_STEPS + 1))
-fi
 
 # ----- Step 1: Preview render in Windows Blender -----
 STEP=1
@@ -267,95 +224,24 @@ log_cmd_array "${DINO_CMD[@]}"
 [ -f out/user_importance.npy ] || die "Missing out/user_importance.npy after DINO."
 
 
-# ----- Step 3 (optional LuxCore branch) -----
-if [ "$SHOULD_EXPORT" -eq 1 ]; then
-  STEP=$((STEP + 1))
-  log_step "${STEP}/${TOTAL_STEPS}" "Exporting LuxCore SDL via Windows Blender..."
-
-  WIN_EXPORT_SCRIPT="$(wslpath -w "$PWD/$EXPORT_SCRIPT")"
-  EXPORT_CMD=("$BLENDER_EXE" "$WIN_BLEND_FILE" -b -E CYCLES "${BLENDER_ARGS[@]}" -P "$WIN_EXPORT_SCRIPT")
-  if [ -n "${SCDL_CYCLES_DEVICE:-}" ]; then
-    EXPORT_CMD+=(-- --cycles-device "${SCDL_CYCLES_DEVICE}")
-  fi
-  log_cmd_array "${EXPORT_CMD[@]}"
-  run_blender_cmd "${EXPORT_CMD[@]}" || die "Blender export step failed."
-
-  # Locate exported SDL; some BlendLuxCore versions place files in subfolders
-  CFG_FOUND=""
-  SCN_FOUND=""
-  if [ -f export/render.cfg ]; then CFG_FOUND="export/render.cfg"; fi
-  if [ -f export/scene.scn ];  then SCN_FOUND="export/scene.scn"; fi
-  if [ -z "$CFG_FOUND" ] || [ -z "$SCN_FOUND" ]; then
-    log_info "Searching for exported SDL inside ./export ..."
-    [ -z "$CFG_FOUND" ] && CFG_FOUND="$(find export -type f -name 'render.cfg' -print0 2>/dev/null | xargs -0 -r ls -t 2>/dev/null | head -n1 || true)"
-    [ -z "$SCN_FOUND" ] && SCN_FOUND="$(find export -type f -name 'scene.scn'  -print0 2>/dev/null | xargs -0 -r ls -t 2>/dev/null | head -n1 || true)"
-  fi
-  [ -n "$CFG_FOUND" ] || die "Missing export/render.cfg after Blender export."
-  [ -n "$SCN_FOUND" ]  || die "Missing export/scene.scn after Blender export."
-  log_info "Using SDL: $CFG_FOUND (scene: $SCN_FOUND)"
-
-  # Export the exact cfg path so the WSL render uses the correct resolver base
-  export SCDL_CFG_PATH="$(realpath "$CFG_FOUND")"
-else
-# ----- Step 3 (default Blender ROI + composite) -----
-  STEP=$((STEP + 1))
-  log_step "${STEP}/${TOTAL_STEPS}" "Rendering ROI + composite in Windows Blender..."
-  log_info "LuxCore export not requested; using Blender ROI composite for the final image."
-  WIN_FINAL_SCRIPT="$(wslpath -w "$PWD/$FINAL_SCRIPT")"
-  FINAL_CMD=("$BLENDER_EXE" "$WIN_BLEND_FILE" -b -E CYCLES "${BLENDER_ARGS[@]}" -P "$WIN_FINAL_SCRIPT")
-  if [ -n "${SCDL_CYCLES_DEVICE:-}" ]; then
-    FINAL_CMD+=(-- --cycles-device "${SCDL_CYCLES_DEVICE}")
-  fi
-  log_cmd_array "${FINAL_CMD[@]}"
-  run_blender_cmd "${FINAL_CMD[@]}" || die "Blender final (ROI) step failed."
+# ----- Step 3: ROI + composite in Windows Blender -----
+STEP=$((STEP + 1))
+log_step "${STEP}/${TOTAL_STEPS}" "Rendering ROI + composite in Windows Blender..."
+WIN_FINAL_SCRIPT="$(wslpath -w "$PWD/$FINAL_SCRIPT")"
+FINAL_CMD=("$BLENDER_EXE" "$WIN_BLEND_FILE" -b -E CYCLES "${BLENDER_ARGS[@]}" -P "$WIN_FINAL_SCRIPT")
+if [ -n "${SCDL_CYCLES_DEVICE:-}" ]; then
+  FINAL_CMD+=(-- --cycles-device "${SCDL_CYCLES_DEVICE}")
 fi
+log_cmd_array "${FINAL_CMD[@]}"
+run_blender_cmd "${FINAL_CMD[@]}" || die "Blender final (ROI) step failed."
 
-# ----- Step 4 (only when following LuxCore branch): WSL final render -----
-if [ "$use_wsl_final" -eq 1 ]; then
-  STEP=$((STEP + 1))
-  log_step "${STEP}/${TOTAL_STEPS}" "Running LuxCore final render in WSL..."
-  [ -n "${SCDL_CFG_PATH:-}" ] || die "SCDL_CFG_PATH not set; rerun with successful LuxCore export."
-  # Activate conda env and run
-  if [ -x "$CONDA_EXE" ]; then
-    # Some conda activate.d scripts assume unset vars are allowed; disable nounset temporarily
-    set +u
-    # shellcheck disable=SC1090
-    source "$("$CONDA_EXE" info --base)/etc/profile.d/conda.sh"
-    conda activate "$CONDA_ENV"
-    set -u
-  else
-    log_warn "CONDA_EXE not found; using system python."
-  fi
-  WSL_RENDER_CMD=(python "$WSL_RENDER_SCRIPT")
-  log_cmd_array "${WSL_RENDER_CMD[@]}"
-  "${WSL_RENDER_CMD[@]}"
-elif [ "$force_export" -eq 1 ]; then
-  log_info "Skipping Blender final render (SCDL_FORCE_LUXCORE_EXPORT=1)."
-fi
-
-# Verify final output when produced
-if [ "$SHOULD_EXPORT" -eq 0 ] || [ "$use_wsl_final" -eq 1 ]; then
-  [ -f out/final.png ] || die "Final render not found at out/final.png"
-fi
+# Verify final output
+[ -f out/final.png ] || die "Final render not found at out/final.png"
 
 declare -a OUTPUT_PATHS
 OUTPUT_PATHS+=("out/preview.png")
 OUTPUT_PATHS+=("out/user_importance.npy")
-if [ "$SHOULD_EXPORT" -eq 1 ]; then
-  if [ -n "${CFG_FOUND:-}" ]; then
-    OUTPUT_PATHS+=("$CFG_FOUND")
-  else
-    OUTPUT_PATHS+=("export/render.cfg")
-  fi
-  if [ -n "${SCN_FOUND:-}" ]; then
-    OUTPUT_PATHS+=("$SCN_FOUND")
-  else
-    OUTPUT_PATHS+=("export/scene.scn")
-  fi
-fi
-if [ "$SHOULD_EXPORT" -eq 0 ] || [ "$use_wsl_final" -eq 1 ]; then
-  OUTPUT_PATHS+=("out/final.png")
-fi
+OUTPUT_PATHS+=("out/final.png")
 
 if [ "${#OUTPUT_PATHS[@]}" -gt 0 ]; then
   printf -v _outputs_str '%s, ' "${OUTPUT_PATHS[@]}"
