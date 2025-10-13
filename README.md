@@ -1,5 +1,5 @@
 # Scene-Driven Composite LuxCore Pipeline
-
+(luxcore version)
 ## Overview
 This repository hosts a hybrid Windows/WSL rendering pipeline that produces a saliency-guided final image. Blender (running on Windows) generates a fast preview, WSL computes a DINO-based importance map, and a selective high-quality re-render produces the final composite. An optional LuxCore branch exports SDL from Blender and performs the final render directly under WSL. The full stage-by-stage breakdown now lives in `pipeline.md`.
 
