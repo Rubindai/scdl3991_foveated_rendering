@@ -245,7 +245,10 @@ def dense_feature_importance_mask(img_np_hw3: np.ndarray, model, preprocess, dev
         return _normalize01(sal).detach().cpu().numpy().astype(np.float32)
 
     # USER path (default)
-    scales_str = os.environ.get("SCDL_MASK_SCALES", "336,392,448").strip()
+    # Default to a single high-resolution scale for efficiency. For higher quality,
+    # you can use multiple scales by setting the environment variable, e.g.:
+    # SCDL_MASK_SCALES="336,392,448"
+    scales_str = os.environ.get("SCDL_MASK_SCALES", "448").strip()
     sizes = [int(s) for s in scales_str.split(",") if s.strip().isdigit()]
     sizes = [s for s in sizes if 160 <= s <= 448] or [336]
     maps = []

@@ -182,7 +182,7 @@ def render_preview():
 
     try:
         scene.cycles.samples = PREVIEW_SPP
-        scene.cycles.use_adaptive_sampling = False
+        scene.cycles.use_adaptive_sampling = True
         if PREVIEW_DENOISE:
             for vl in scene.view_layers:
                 try:
