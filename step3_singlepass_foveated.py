@@ -17,6 +17,12 @@ if str(project_dir) not in sys.path:
 from logging_utils import get_logger
 from scdl_config import get_pipeline_paths
 
+try:
+    # Optional: reuse device configuration helper if available
+    import blender_steps as _bs  # type: ignore
+except Exception:
+    _bs = None  # type: ignore
+
 # --- Configuration ---
 PATHS = get_pipeline_paths(project_dir)
 LOGGER = get_logger("scdl_step3_singlepass", PATHS.log_file)
@@ -80,11 +86,11 @@ def create_foveated_mixer_group(mask_image):
     img_tex.projection = 'FLAT'
     img_tex.location = Vector((-200, -200))
 
-    # Aspect Ratio Correction
-    render = bpy.context.scene.render
-    # Use window coords directly; keep mapping scale at 1 to avoid distortion
-    mapping.inputs['Scale'].default_value.x = 1.0
-    mapping.inputs['Scale'].default_value.y = 1.0
+    # Screen-space mapping (Window) with Y flip to account for image row origin
+    # Equivalent to: y' = 1 - y
+    mapping.inputs['Scale'].default_value[0] = 1.0
+    mapping.inputs['Scale'].default_value[1] = -1.0
+    mapping.inputs['Location'].default_value[1] = 1.0
 
     # Links
     g.links.new(tex_coord.outputs['Window'], mapping.inputs['Vector'])
@@ -108,9 +114,19 @@ def main():
     scene.render.engine = 'CYCLES'
     cycles = scene.cycles
 
-    # Use GPU if available
-    cycles.device = CYCLES_DEVICE
-    log_info(f"Set Cycles device to: {cycles.device}")
+    # Configure device sensibly
+    try:
+        if _bs is not None and hasattr(_bs, "_configure_cycles_device"):
+            _bs._ensure_cycles_addon()
+            _bs._configure_cycles_device(scene)
+            log_info("Configured Cycles device via helper.")
+        else:
+            # Fallback: map env to CPU/GPU when possible
+            dev = CYCLES_DEVICE.strip().upper()
+            scene.cycles.device = 'CPU' if dev == 'CPU' else 'GPU'
+            log_info(f"Set Cycles device to: {scene.cycles.device} (raw='{CYCLES_DEVICE}')")
+    except Exception as exc:
+        log_warn(f"Could not configure Cycles device ('{CYCLES_DEVICE}'): {exc}")
 
     # 2. Configure Cycles for single-pass adaptive sampling
     cycles.use_adaptive_sampling = True
@@ -119,7 +135,21 @@ def main():
     cycles.adaptive_min_samples = MIN_SAMPLES
 
     cycles.use_denoising = True
-    cycles.denoiser = 'OPENIMAGEDENOISE' # OIDN is generally good and works on CPU
+    try:
+        cycles.denoiser = 'OPENIMAGEDENOISE'  # OIDN generally good and CPU-friendly
+    except Exception:
+        pass
+
+    # Enable denoising on view layers and store guiding passes (albedo/normal)
+    for vl in scene.view_layers:
+        try:
+            vl.cycles.use_denoising = True
+        except Exception:
+            pass
+        try:
+            vl.cycles.denoising_store_passes = True
+        except Exception:
+            pass
 
     # Global noise reduction settings
     cycles.caustics_reflective = False
@@ -143,7 +173,11 @@ def main():
         log_info(f"Loading fovea mask: {mpath}")
         try:
             img = bpy.data.images.load(str(mpath))
-            img.colorspace_settings.name = 'Non-Color'
+            # Treat as data to avoid color management
+            try:
+                img.colorspace_settings.name = 'Non-Color'
+            except Exception:
+                pass
             mask_image = img
             if mpath.suffix.lower() != ".exr":
                 log_warn("Using non-EXR mask; precision may be reduced.")
@@ -173,6 +207,13 @@ def main():
         original_shader_node = original_shader_link.from_node
         original_shader_socket = original_shader_link.from_socket
 
+        # Skip if a FoveationMixer already feeds the output
+        if isinstance(original_shader_node, bpy.types.ShaderNodeGroup) and \
+           original_shader_node.node_tree and \
+           original_shader_node.node_tree.name == FOVEATION_GROUP_NAME:
+            log_info(f"Material '{mat.name}' already foveation-mixed; skipping rewire.")
+            continue
+
         # --- Create a simplified version of the shader network ---
         simplified_shader_socket = None
         try:
@@ -194,16 +235,25 @@ def main():
             # 3. Aggressively reduce variance for faster convergence and clearer effect
             node_modified = False
             if hasattr(bpy.types, 'ShaderNodeBsdfPrincipled') and isinstance(simplified_node, bpy.types.ShaderNodeBsdfPrincipled):
-                simplified_node.inputs['Roughness'].default_value = 1.0
-                simplified_node.inputs['Specular'].default_value = 0.0
-                simplified_node.inputs['Metallic'].default_value = 0.0
-                simplified_node.inputs['Transmission'].default_value = 0.0
-                if 'Clearcoat' in simplified_node.inputs:
-                    simplified_node.inputs['Clearcoat'].default_value = 0.0
-                if 'SSS Weight' in simplified_node.inputs:
-                    simplified_node.inputs['SSS Weight'].default_value = 0.0
-                if 'Subsurface' in simplified_node.inputs:
-                    simplified_node.inputs['Subsurface'].default_value = 0.0
+                def set_in(node, name, value):
+                    try:
+                        if name in node.inputs:
+                            node.inputs[name].default_value = value
+                            return True
+                    except Exception:
+                        pass
+                    return False
+
+                # Push to diffuse-like
+                set_in(simplified_node, 'Roughness', 1.0)
+                # Zero variance-heavy features (robust to Blender 4.x renames)
+                for sock in (
+                    'Specular', 'Specular IOR Level', 'Metallic',
+                    'Transmission', 'Transmission Weight',
+                    'Clearcoat', 'Coat Weight',
+                    'Subsurface', 'SSS Weight', 'Sheen', 'Anisotropic',
+                ):
+                    set_in(simplified_node, sock, 0.0)
                 node_modified = True
 
             # If not principled, create a Diffuse fallback for a strong visual difference
@@ -247,8 +297,133 @@ def main():
         tree.links.new(mixer_node.outputs['Shader'], output_node.inputs['Surface'])
         log_info(f"Applied foveation mix to '{mat.name}'")
 
+    # 6. Optional compositing: blur periphery guided by mask (defocus mode)
+    focus_mode = os.environ.get("SCDL_FOCUS_MODE", "defocus").strip().lower()
+    if focus_mode in ("defocus", "blur"):
+        try:
+            scene.use_nodes = True
+            nt = scene.node_tree
+            nt.nodes.clear(); nt.links.clear()
 
-    # 6. Render and Save
+            rw = int(scene.render.resolution_x)
+            rh = int(scene.render.resolution_y)
+
+            n_rl = nt.nodes.new('CompositorNodeRLayers')
+            n_rl.location = Vector((-600, 200))
+
+            n_blur = nt.nodes.new('CompositorNodeBlur')
+            n_blur.location = Vector((-200, 200))
+            try:
+                n_blur.filter_type = 'GAUSS'
+            except Exception:
+                pass
+            n_blur.use_relative = False
+            blur_px = int(float(os.environ.get("SCDL_DEFOCUS_MAXBLUR", "32")))
+            blur_px = max(0, blur_px)
+            n_blur.size_x = blur_px
+            n_blur.size_y = blur_px
+
+            n_mask = nt.nodes.new('CompositorNodeImage')
+            n_mask.location = Vector((-650, -80))
+            n_mask.image = mask_image
+
+            # Ensure factor is a single channel
+            n_bw = None
+            try:
+                n_bw = nt.nodes.new('CompositorNodeRGBToBW')
+            except Exception:
+                try:
+                    n_bw = nt.nodes.new('CompositorNodeSeparateColor')
+                except Exception:
+                    n_bw = None
+            if n_bw is not None:
+                n_bw.location = Vector((-450, -80))
+
+            n_scale = nt.nodes.new('CompositorNodeScale')
+            n_scale.location = Vector((-250, -80))
+            # Scale the mask from its native size to render size using relative factors
+            try:
+                mw, mh = int(mask_image.size[0]), int(mask_image.size[1])
+            except Exception:
+                mw, mh = rw, rh
+            sx = float(rw) / max(1.0, float(mw))
+            sy = float(rh) / max(1.0, float(mh))
+            try:
+                n_scale.space = 'RELATIVE'
+            except Exception:
+                pass
+            n_scale.inputs['X'].default_value = sx
+            n_scale.inputs['Y'].default_value = sy
+
+            n_mix = nt.nodes.new('CompositorNodeMixRGB')
+            n_mix.location = Vector((0, 100))
+            n_mix.blend_type = 'MIX'
+
+            n_comp = nt.nodes.new('CompositorNodeComposite')
+            n_comp.location = Vector((200, 100))
+
+            # Links: output = mask*sharp + (1-mask)*blur
+            nt.links.new(n_rl.outputs['Image'], n_blur.inputs['Image'])
+            nt.links.new(n_blur.outputs['Image'], n_mix.inputs[1])  # A = blur
+            nt.links.new(n_rl.outputs['Image'], n_mix.inputs[2])    # B = sharp
+            if n_bw is not None:
+                # Route through grayscale
+                in_name = 'Image' if 'Image' in [s.name for s in n_bw.inputs] else list(n_bw.inputs)[0].name
+                nt.links.new(n_mask.outputs['Image'], n_bw.inputs[in_name])
+                out_name = 'Val'
+                names = [s.name for s in n_bw.outputs]
+                if out_name not in names and names:
+                    out_name = names[0]
+                nt.links.new(n_bw.outputs[out_name], n_scale.inputs['Image'])
+            else:
+                # Fallback: feed color directly; Blender will implicitly convert to value
+                nt.links.new(n_mask.outputs['Image'], n_scale.inputs['Image'])
+            nt.links.new(n_scale.outputs['Image'], n_mix.inputs[0]) # Fac = mask (scalar)
+            nt.links.new(n_mix.outputs['Image'], n_comp.inputs['Image'])
+
+            # Optional debug outputs of mask/blur/mix to out/ (disabled by default)
+            if int(os.environ.get("SCDL_SAVE_COMPOSITOR_DEBUG", "0")):
+                try:
+                    n_out = nt.nodes.new('CompositorNodeOutputFile')
+                    n_out.location = Vector((200, -100))
+                    n_out.format.file_format = 'PNG'
+                    n_out.base_path = str(PATHS.out_dir)
+                    # Clear default slot and add named slots
+                    while len(n_out.file_slots) > 0:
+                        n_out.file_slots.remove(n_out.file_slots[0])
+                    s_mask = n_out.file_slots.new('mask')
+                    s_blur = n_out.file_slots.new('blur')
+                    s_mix  = n_out.file_slots.new('mix')
+                    s_mask.path = 'debug_mask'
+                    s_blur.path = 'debug_blur'
+                    s_mix.path  = 'debug_mix'
+                    nt.links.new(n_scale.outputs['Image'], s_mask)
+                    nt.links.new(n_blur.outputs['Image'],  s_blur)
+                    nt.links.new(n_mix.outputs['Image'],   s_mix)
+                    log_info("Compositor debug outputs enabled (mask/blur/mix).")
+                except Exception as exc:
+                    log_warn(f"Could not enable compositor debug outputs: {exc}")
+
+            log_info("Compositor set: periphery blur enabled (defocus mode).")
+        except Exception as exc:
+            log_warn(f"Could not set compositor defocus: {exc}")
+    elif focus_mode == "dof":
+        # Optional: enable camera DOF if requested by env (depth-based bokeh)
+        try:
+            cam = scene.camera.data if scene.camera else None
+            if cam and hasattr(cam, 'dof'):
+                cam.dof.use_dof = True
+                fstop = float(os.environ.get("SCDL_FOCUS_FSTOP", "2.8"))
+                cam.dof.aperture_fstop = fstop
+                dist = float(os.environ.get("SCDL_FOCUS_DISTANCE", "2.0"))
+                cam.dof.focus_distance = dist
+                log_info(f"Camera DOF enabled (fstop={fstop}, distance={dist}).")
+        except Exception as exc:
+            log_warn(f"Could not configure camera DOF: {exc}")
+    else:
+        log_info("Focus mode off; skipping compositor blur.")
+
+    # 7. Render and Save
     log_info("Starting final render...")
     scene.render.filepath = str(PATHS.final)
     scene.render.image_settings.file_format = 'PNG'
