@@ -174,7 +174,7 @@ BLENDER_EXE="${BLENDER_EXE:-/mnt/d/Programs/blender/blender.exe}"
 # Priority: CLI arg > BLEND_FILE from env/.scdl.env > default
 BLEND_FILE="${1:-${BLEND_FILE:-blender_files/cookie.blend}}"
 PREVIEW_SCRIPT="step1_preview_blender.py"              # renders out/preview.png next to the .blend
-FINAL_SCRIPT="step3_blender_roi_compose.py"            # ROI + composite to out/final.png
+FINAL_SCRIPT="step3_singlepass_foveated.py"            # Single-pass foveated render to out/final.png
 WSL_DINO_SCRIPT="step2_dino_mask.py"
 
 # ========================
@@ -218,7 +218,7 @@ log_step "${STEP}/${TOTAL_STEPS}" "Computing DINO mask in WSL..."
 
 # Ensure the Python scripts resolve project paths to this repo
 export SCDL_PROJECT_DIR="$PWD"
-DINO_CMD=(python "$WSL_DINO_SCRIPT")
+DINO_CMD=(conda run -n scdl-foveated python "$WSL_DINO_SCRIPT")
 log_cmd_array "${DINO_CMD[@]}"
 "${DINO_CMD[@]}" || die "DINO mask step failed."
 [ -f out/user_importance.npy ] || die "Missing out/user_importance.npy after DINO."
@@ -226,7 +226,7 @@ log_cmd_array "${DINO_CMD[@]}"
 
 # ----- Step 3: ROI + composite in Windows Blender -----
 STEP=$((STEP + 1))
-log_step "${STEP}/${TOTAL_STEPS}" "Rendering ROI + composite in Windows Blender..."
+log_step "${STEP}/${TOTAL_STEPS}" "Rendering final image (single-pass foveated) in Windows Blender..."
 WIN_FINAL_SCRIPT="$(wslpath -w "$PWD/$FINAL_SCRIPT")"
 FINAL_CMD=("$BLENDER_EXE" "$WIN_BLEND_FILE" -b -E CYCLES "${BLENDER_ARGS[@]}" -P "$WIN_FINAL_SCRIPT")
 if [ -n "${SCDL_CYCLES_DEVICE:-}" ]; then

@@ -57,6 +57,7 @@ LOGGER = get_logger("scdl_step2", PATHS.log_file)
 
 def log_info(msg: str): LOGGER.info(msg)
 def log_warn(msg: str): LOGGER.warning(msg)
+def log_error(msg: str): LOGGER.error(msg)
 
 
 def fail(msg: str, code: int = 1):
@@ -481,9 +482,11 @@ def main():
     mask = refine_with_grabcut(
         img[:, :, :3].astype(np.uint8), mask, iters=None)
     mask = refine_with_watershed(img[:, :, :3].astype(np.uint8), mask)
+
+    # --- Save the raw mask and its visualization for sanity checks FIRST ---
     np.save(MASK_NPY, mask)
 
-    # ------- Save visualizations -------
+    # Create and save visualization from the raw mask
     lo, hi = np.percentile(mask, 2), np.percentile(mask, 98)
     spread = max(hi - lo, 1e-6)
     viz = np.clip((mask - lo) / spread, 0, 1)
@@ -493,8 +496,67 @@ def main():
         viz = np.clip(viz * (1.0 - 0.08) + grid, 0, 1)
     iio.imwrite(MASK_PREVIEW, (viz * 255).astype(np.uint8))
     log_info(
-        f"[OK] Saved mask: {MASK_NPY}  shape={mask.shape}  min={mask.min():.3f} max={mask.max():.3f} mean={mask.mean():.3f}")
-    log_info(f"[OK] Saved viz : {MASK_PREVIEW}")
+        f"[OK] Saved raw mask: {MASK_NPY}  shape={mask.shape}  min={mask.min():.3f} max={mask.max():.3f} mean={mask.mean():.3f}")
+    log_info(f"[OK] Saved raw viz : {MASK_PREVIEW}")
+
+
+    # --- NOW, soften and save the EXR mask for Blender ---
+    try:
+        import cv2
+        # Apply a small Gaussian blur to soften the mask and prevent hard edges
+        blur_sigma = float(os.environ.get("SCDL_MASK_BLUR_SIGMA", "1.5"))
+        if blur_sigma > 0:
+            mask = cv2.GaussianBlur(mask, (0, 0), blur_sigma)
+            # Renormalize after blur
+            m_min, m_max = mask.min(), mask.max()
+            if m_max > m_min:
+                mask = (mask - m_min) / (m_max - m_min)
+    except ImportError:
+        log_warn("[WARN] OpenCV not found; skipping Gaussian blur for Blender mask.")
+
+    # Save the blurred mask as a float EXR file for Blender, with robust fallbacks
+    exr_path = OUT_DIR / "fovea_mask.exr"
+    png_fallback_path = OUT_DIR / "fovea_mask.png"
+    mask_float32 = mask.astype(np.float32)
+    def _save_exr_via_openexr() -> bool:
+        try:
+            import OpenEXR  # type: ignore
+            import Imath    # type: ignore
+        except Exception:
+            return False
+        try:
+            H, W = mask_float32.shape
+            header = OpenEXR.Header(W, H)
+            header['channels'] = {
+                'R': Imath.Channel(Imath.PixelType(Imath.PixelType.FLOAT))
+            }
+            exr_file = OpenEXR.OutputFile(str(exr_path), header)
+            exr_file.writePixels({'R': mask_float32.tobytes()})
+            exr_file.close()
+            log_info(f"[OK] Saved float EXR mask for Blender -> {exr_path}")
+            return True
+        except Exception as e:
+            log_error(f"Failed to save EXR via OpenEXR: {e}")
+            return False
+
+    def _save_exr_via_imageio() -> bool:
+        try:
+            iio.imwrite(exr_path, mask_float32)
+            log_info(f"[OK] Saved EXR mask via imageio -> {exr_path}")
+            return True
+        except Exception as e:
+            log_warn(f"[WARN] imageio could not write EXR ({e}); will try PNG fallback.")
+            return False
+
+    wrote_exr = _save_exr_via_openexr() or _save_exr_via_imageio()
+    if not wrote_exr:
+        # Final fallback: 16-bit PNG. Step 3 will accept this as a fallback.
+        try:
+            png16 = np.clip(mask_float32, 0.0, 1.0)
+            iio.imwrite(png_fallback_path, (png16 * 65535.0).astype(np.uint16))
+            log_warn(f"[WARN] EXR not available; saved 16-bit PNG fallback -> {png_fallback_path}")
+        except Exception as e:
+            fail(f"Could not save any mask format (EXR/PNG). Error: {e}")
 
     # Optional extra debug outputs
     if int(os.environ.get("SCDL_SAVE_ATTENTION", "0")):

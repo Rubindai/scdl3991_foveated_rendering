@@ -1,22 +1,41 @@
 # Scene-Driven Composite Pipeline
 
 ## Overview
-This repository hosts a hybrid Windows/WSL rendering pipeline that produces a saliency-guided final image. Blender (running on Windows) generates a fast preview, WSL computes a DINO-based importance map, and a selective high-quality Cycles re-render produces the final composite. The full stage-by-stage breakdown lives in `pipeline.md`.
+This repository hosts a hybrid Windows/WSL rendering pipeline that produces a saliency-guided foveated render in a single pass. Blender (running on Windows) generates a fast preview, and WSL computes a DINO-based importance map from it. A final, efficient render pass in Blender then uses this mask to vary rendering quality across the image, focusing detail on important regions without needing to composite multiple images.
+
+*(Note: The `pipeline.md` file describes a previous, deprecated version of this pipeline.)*
+
+## Installation
+
+This project uses [Conda](https://docs.conda.io/en/latest/) to manage the Python environment for the analysis scripts (Step 2).
+
+1.  **Create the Conda Environment:**
+    From the project root directory, run the following command to create the environment from the provided file:
+    ```bash
+    conda env create -f environment.yml
+    ```
+
+2.  **Activate the Environment:**
+    Before running the main pipeline script, you must activate the Conda environment:
+    ```bash
+    conda activate scdl-foveated
+    ```
+
+This will install all the necessary Python dependencies (PyTorch, OpenCV, OpenEXR, etc.).
 
 ## Prerequisites
-- Windows Blender installation accessible from WSL (configure `BLENDER_EXE` in `.scdl.env`).
-- WSL environment with Python 3.9+, PyTorch (CUDA optional), torchvision, timm, imageio, and numpy.
-- Blend files stored under `blender_files/` (default `cookie.blend`).
-- DINOv3 repo + weights (paths configurable via `.scdl.env`; upstream: https://github.com/facebookresearch/dinov3, mirror weights: https://drive.google.com/drive/folders/1Gg6it9iF08VrFRwQVmbzWuUv2o6JTtlH?usp=sharing).
+- Windows Blender installation accessible from WSL.
+- A local clone of the DINOv3 repository and its pre-trained weights.
+- Conda installed on your system.
 
-## Setup
-1. Review and edit `.scdl.env` to match your environment paths, Blender executable, and stage defaults (preview ROI area, DINO weights).
-2. Place your working `.blend` files in `blender_files/` or override `BLEND_FILE` via CLI/environment.
-3. Ensure the `dinov3` submodule/clone and weights are present as referenced by `.scdl.env`.
+## Configuration
+1. Review and edit `.scdl.env` to match your environment paths, especially `BLENDER_EXE`.
+2. Place your working `.blend` files in `blender_files/` or override the `BLEND_FILE` environment variable.
+3. Ensure the `dinov3` repository and weights paths in `.scdl.env` are correct.
 
 ## Running the Pipeline
 ```bash
-# Preview → DINO mask → Blender ROI composite
+# Preview → DINO mask → Single-pass foveated render
 ./run_windows_blender_wsl.sh
 ```
 - Pass a different blend file with `./run_windows_blender_wsl.sh blender_files/your_scene.blend`.
