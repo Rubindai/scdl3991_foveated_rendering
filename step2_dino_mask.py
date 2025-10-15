@@ -21,6 +21,9 @@ import sys
 import heapq
 import contextlib
 from pathlib import Path
+
+os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
+
 import numpy as np
 import imageio.v3 as iio
 from PIL import Image
@@ -502,7 +505,11 @@ def main():
 
     # --- NOW, soften and save the EXR mask for Blender ---
     try:
-        import cv2
+        import cv2  # type: ignore
+    except ImportError as exc:  # pragma: no cover - hard failure
+        fail(f"OpenCV is required for mask post-processing but was not found ({exc}).")
+
+    try:
         # Apply a small Gaussian blur to soften the mask and prevent hard edges
         blur_sigma = float(os.environ.get("SCDL_MASK_BLUR_SIGMA", "1.5"))
         if blur_sigma > 0:
@@ -511,12 +518,11 @@ def main():
             m_min, m_max = mask.min(), mask.max()
             if m_max > m_min:
                 mask = (mask - m_min) / (m_max - m_min)
-    except ImportError:
-        log_warn("[WARN] OpenCV not found; skipping Gaussian blur for Blender mask.")
+    except Exception as exc:  # pragma: no cover - hard failure
+        fail(f"Gaussian blur failed in OpenCV: {exc}")
 
-    # Save the blurred mask as a float EXR file for Blender, with robust fallbacks
+    # Save the blurred mask as a float EXR file for Blender (fail hard otherwise)
     exr_path = OUT_DIR / "fovea_mask.exr"
-    png_fallback_path = OUT_DIR / "fovea_mask.png"
     mask_float32 = mask.astype(np.float32)
     def _save_exr_via_openexr() -> bool:
         try:
@@ -539,24 +545,42 @@ def main():
             log_error(f"Failed to save EXR via OpenEXR: {e}")
             return False
 
+    def _save_exr_via_opencv() -> bool:
+        try:
+            import cv2  # type: ignore
+        except Exception:
+            return False
+        try:
+            ok = cv2.imwrite(str(exr_path), mask_float32)
+            if ok:
+                log_info(f"[OK] Saved EXR mask via OpenCV -> {exr_path}")
+            else:
+                log_warn("[WARN] OpenCV reported failure writing EXR mask.")
+            return bool(ok)
+        except Exception as e:
+            log_warn(f"[WARN] OpenCV could not write EXR ({e})")
+            return False
+
     def _save_exr_via_imageio() -> bool:
         try:
             iio.imwrite(exr_path, mask_float32)
             log_info(f"[OK] Saved EXR mask via imageio -> {exr_path}")
             return True
         except Exception as e:
-            log_warn(f"[WARN] imageio could not write EXR ({e}); will try PNG fallback.")
+            log_warn(f"[WARN] imageio could not write EXR ({e})")
             return False
 
-    wrote_exr = _save_exr_via_openexr() or _save_exr_via_imageio()
+    wrote_exr = (
+        _save_exr_via_openexr()
+        or _save_exr_via_opencv()
+        or _save_exr_via_imageio()
+    )
     if not wrote_exr:
-        # Final fallback: 16-bit PNG. Step 3 will accept this as a fallback.
-        try:
-            png16 = np.clip(mask_float32, 0.0, 1.0)
-            iio.imwrite(png_fallback_path, (png16 * 65535.0).astype(np.uint16))
-            log_warn(f"[WARN] EXR not available; saved 16-bit PNG fallback -> {png_fallback_path}")
-        except Exception as e:
-            fail(f"Could not save any mask format (EXR/PNG). Error: {e}")
+        fail(
+            "Failed to save fovea mask as EXR. "
+            "Ensure OpenEXR/python bindings are installed or enable OpenCV EXR support "
+            "(OPENCV_IO_ENABLE_OPENEXR=1)."
+        )
 
     # Optional extra debug outputs
     if int(os.environ.get("SCDL_SAVE_ATTENTION", "0")):

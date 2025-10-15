@@ -3,10 +3,15 @@
 # Purpose: Render the final image in a single pass using a foveation mask
 # to guide adaptive sampling. Replaces the old composite-based step3.
 
+from __future__ import annotations
+
 import os
 import sys
+import time
 from pathlib import Path
+
 import bpy
+import numpy as np
 from mathutils import Vector
 
 # Add project dir to path to import local modules
@@ -28,10 +33,36 @@ PATHS = get_pipeline_paths(project_dir)
 LOGGER = get_logger("scdl_step3_singlepass", PATHS.log_file)
 
 # Read config from environment variables, consistent with other scripts
-CYCLES_DEVICE = os.environ.get("SCDL_CYCLES_DEVICE", "CPU")
-ADAPTIVE_THRESHOLD = float(os.environ.get("SCDL_ROI_CYCLES_THRESHOLD", "0.01"))
-MAX_SAMPLES = int(os.environ.get("SCDL_BASE_CYCLES_SPP", "1024"))
-MIN_SAMPLES = int(os.environ.get("SCDL_ROI_ADAPTIVE_MIN_SAMPLES", "32"))
+_ENV_CACHE: dict[str, str] | None = None
+
+
+def _get_env_value(key: str, default: str) -> str:
+    """Fetch configuration from env with .scdl.env fallback when Windows clears exports."""
+    val = os.environ.get(key)
+    if val not in (None, ""):
+        return val
+    global _ENV_CACHE
+    if _ENV_CACHE is None:
+        _ENV_CACHE = {}
+        env_file = PATHS.project_dir / ".scdl.env"
+        if env_file.exists():
+            for line in env_file.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                _ENV_CACHE[k.strip()] = v.strip()
+    if _ENV_CACHE is None:
+        return default
+    return _ENV_CACHE.get(key, default)
+
+
+ADAPTIVE_THRESHOLD = float(_get_env_value("SCDL_ROI_CYCLES_THRESHOLD", "0.03"))
+BASE_SAMPLES = int(_get_env_value("SCDL_BASE_CYCLES_SPP", "256"))
+ROI_SAMPLES = int(_get_env_value("SCDL_ROI_CYCLES_SPP", str(max(BASE_SAMPLES, 512))))
+MIN_SAMPLES = int(_get_env_value("SCDL_ROI_ADAPTIVE_MIN_SAMPLES", "32"))
+CYCLES_DEVICE = _get_env_value("SCDL_CYCLES_DEVICE", "CPU")
+AUTO_SPP = int(_get_env_value("SCDL_FOVEATED_AUTOSPP", "1")) != 0
 
 # --- Constants ---
 FOVEATION_GROUP_NAME = "FoveationMixer"
@@ -43,6 +74,11 @@ def fail(msg: str, code: int = 1):
     LOGGER.error(msg)
     bpy.ops.wm.quit_blender()
     sys.exit(code)
+
+
+def _format_duration(seconds: float) -> str:
+    minutes, secs = divmod(seconds, 60.0)
+    return f"{int(minutes):02d}:{secs:05.2f}"
 
 def create_foveated_mixer_group(mask_image):
     """
@@ -104,6 +140,19 @@ def create_foveated_mixer_group(mask_image):
 
     return g
 
+
+def _estimate_mask_coverage(mask_image: bpy.types.Image) -> float:
+    """Return average mask value (0..1) to guide sampling budget."""
+    channels = max(1, getattr(mask_image, "channels", 1))
+    buffer = np.array(mask_image.pixels[:], dtype=np.float32)
+    if buffer.size == 0:
+        return 1.0
+    if channels > 1:
+        buffer = buffer.reshape(-1, channels)[:, 0]
+    coverage = float(np.clip(buffer.mean(), 0.0, 1.0))
+    # Guard against degenerate masks that are nearly zero
+    return max(coverage, 0.05)
+
 def main():
     """Main execution function"""
     log_info("--- Step 3: Single-Pass Foveated Render ---")
@@ -131,8 +180,8 @@ def main():
     # 2. Configure Cycles for single-pass adaptive sampling
     cycles.use_adaptive_sampling = True
     cycles.adaptive_threshold = ADAPTIVE_THRESHOLD
-    cycles.samples = MAX_SAMPLES
-    cycles.adaptive_min_samples = MIN_SAMPLES
+    cycles.samples = ROI_SAMPLES
+    cycles.adaptive_min_samples = min(MIN_SAMPLES, cycles.samples)
 
     cycles.use_denoising = True
     try:
@@ -158,14 +207,8 @@ def main():
 
     log_info(f"Configured Cycles for adaptive sampling (threshold={cycles.adaptive_threshold}, min={cycles.adaptive_min_samples}, max={cycles.samples})")
 
-    # 3. Load fovea mask
-    # Prefer EXR; gracefully fallback to PNG variants if EXR is unavailable
-    mask_candidates = [
-        PATHS.out_dir / "fovea_mask.exr",
-        PATHS.out_dir / "fovea_mask.png",
-        PATHS.mask_preview,  # user_importance_preview.png (8-bit)
-    ]
-
+    # 3. Load fovea mask (EXR required for precision)
+    mask_candidates = [PATHS.out_dir / "fovea_mask.exr"]
     mask_image = None
     for mpath in mask_candidates:
         if not mpath.exists():
@@ -179,14 +222,25 @@ def main():
             except Exception:
                 pass
             mask_image = img
-            if mpath.suffix.lower() != ".exr":
-                log_warn("Using non-EXR mask; precision may be reduced.")
             break
         except Exception as e:
             log_warn(f"Failed to load mask at {mpath}: {e}")
 
     if mask_image is None:
-        fail("No usable foveation mask found. Expected fovea_mask.exr or PNG fallback from Step 2.")
+        fail("No usable foveation mask found. Expected fovea_mask.exr from Step 2.")
+
+    if AUTO_SPP:
+        try:
+            coverage = _estimate_mask_coverage(mask_image)
+            target_spp = int(round(BASE_SAMPLES + (ROI_SAMPLES - BASE_SAMPLES) * coverage))
+            target_spp = max(MIN_SAMPLES, min(ROI_SAMPLES, max(BASE_SAMPLES, target_spp)))
+            cycles.samples = target_spp
+            cycles.adaptive_min_samples = min(cycles.samples, MIN_SAMPLES)
+            log_info(f"Auto SPP enabled → mask coverage={coverage:.3f}, samples={cycles.samples}")
+        except Exception as exc:
+            log_warn(f"Auto SPP failed ({exc}); falling back to ROI_SAMPLES={ROI_SAMPLES}")
+            cycles.samples = ROI_SAMPLES
+            cycles.adaptive_min_samples = min(MIN_SAMPLES, cycles.samples)
 
     # 4. Create or get the Foveated Mixer node group
     foveation_group = create_foveated_mixer_group(mask_image)
@@ -265,20 +319,18 @@ def main():
                     diffuse.inputs['Color'].default_value = (0.5, 0.5, 0.5, 1.0)
                     simplified_node = diffuse
                     node_modified = True
-                except Exception:
-                    pass
+                except Exception as exc:
+                    fail(f"Failed to create simplified shader for '{mat.name}' (Diffuse node): {exc}")
 
             if not node_modified:
-                log_warn(f"Could not simplify node type {simplified_node.bl_idname} for material '{mat.name}'. Using original for both paths.")
-                simplified_shader_socket = original_shader_socket
-            else:
-                # Find the correct output socket on the new node
-                out_name = original_shader_socket.name if original_shader_socket.name in [s.name for s in simplified_node.outputs] else 'BSDF'
-                simplified_shader_socket = simplified_node.outputs[out_name]
+                fail(f"Could not simplify node type {simplified_node.bl_idname} for material '{mat.name}'.")
+
+            # Find the correct output socket on the new node
+            out_name = original_shader_socket.name if original_shader_socket.name in [s.name for s in simplified_node.outputs] else 'BSDF'
+            simplified_shader_socket = simplified_node.outputs[out_name]
 
         except Exception as e:
-            log_warn(f"Failed to create simplified shader for '{mat.name}', using original for both paths. Error: {e}")
-            simplified_shader_socket = original_shader_socket
+            fail(f"Failed to create simplified shader for '{mat.name}': {e}")
 
         # Insert the foveation mixer group
         mixer_node = tree.nodes.new('ShaderNodeGroup')
@@ -427,7 +479,10 @@ def main():
     log_info("Starting final render...")
     scene.render.filepath = str(PATHS.final)
     scene.render.image_settings.file_format = 'PNG'
+    render_start = time.perf_counter()
     bpy.ops.render.render(write_still=True)
+    render_elapsed = time.perf_counter() - render_start
+    log_info(f"Time: {_format_duration(render_elapsed)} (render)")
     log_info(f"Finished. Final image saved to {PATHS.final}")
 
     bpy.ops.wm.quit_blender()

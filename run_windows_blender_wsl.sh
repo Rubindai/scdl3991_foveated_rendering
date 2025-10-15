@@ -26,6 +26,59 @@ LOG_MODE="${SCDL_LOG_MODE:-both}"
 LOG_MODE="${LOG_MODE,,}"
 LOG_PATH="${SCDL_LOG_FILE:-$PWD/out/scdl_pipeline.log}"
 ANSI_STRIP_EXPR=$'s/\x1B\[[0-9;]*[A-Za-z]//g'
+
+OUT_DIR="$PWD/out"
+OUT_CLEAR_NOTE=""
+if [ "${SCDL_CLEAR_OUT_DIR:-1}" != "0" ]; then
+  if [ -d "$OUT_DIR" ] && [ "$OUT_DIR" != "$PWD" ] && [ "$OUT_DIR" != "/" ]; then
+    rm -rf -- "$OUT_DIR"
+    OUT_CLEAR_NOTE="Cleared existing output directory: $OUT_DIR"
+  else
+    OUT_CLEAR_NOTE="Initialized output directory: $OUT_DIR"
+  fi
+else
+  OUT_CLEAR_NOTE="Skipped clearing output directory (SCDL_CLEAR_OUT_DIR=0)."
+fi
+mkdir -p "$OUT_DIR"
+
+PIPELINE_START=$(date +%s)
+declare -a STEP_NAMES=()
+declare -a STEP_DURATIONS=()
+declare -a STEP_REPORTED_TIMES=()
+BLENDER_TIME_FILE="$(mktemp)"
+
+cleanup_temp() {
+  if [ -f "$BLENDER_TIME_FILE" ]; then
+    rm -f "$BLENDER_TIME_FILE"
+  fi
+}
+trap cleanup_temp EXIT
+
+format_duration() {
+  local total=${1:-0}
+  local hours=$((total / 3600))
+  local minutes=$(((total % 3600) / 60))
+  local seconds=$((total % 60))
+  if [ "$hours" -gt 0 ]; then
+    printf '%02d:%02d:%02d' "$hours" "$minutes" "$seconds"
+  else
+    printf '%02d:%02d' "$minutes" "$seconds"
+  fi
+}
+
+record_step_duration() {
+  local name="$1"
+  local seconds="$2"
+  STEP_NAMES+=("$name")
+  STEP_DURATIONS+=("$seconds")
+  local reported=""
+  if [ -s "$BLENDER_TIME_FILE" ]; then
+    reported="$(tail -n 1 "$BLENDER_TIME_FILE")"
+  fi
+  STEP_REPORTED_TIMES+=("$reported")
+  : > "$BLENDER_TIME_FILE"
+}
+
 case "$LOG_MODE" in
   both)
     mkdir -p "$(dirname -- "$LOG_PATH")"
@@ -117,8 +170,13 @@ log_cmd_array() {
 log_env() { log_emit "$COLOR_ENV" "[env]" "$*"; }
 log_done() { log_emit "$COLOR_OK" "[DONE]" "$*"; }
 
+if [ -n "$OUT_CLEAR_NOTE" ]; then
+  log_info "$OUT_CLEAR_NOTE"
+fi
+
 filter_blender_output() {
   local line stripped
+  local time_file="$BLENDER_TIME_FILE"
   while IFS= read -r line || [ -n "$line" ]; do
     # Normalize carriage returns that Blender occasionally emits during progress updates
     stripped="${line//$'\r'/}"
@@ -127,10 +185,41 @@ filter_blender_output() {
       continue
     fi
     case "$stripped" in
+      \[INFO\]*)
+        local msg="${stripped#\[INFO\]}"
+        msg="${msg# }"
+        if [[ "$msg" == Time:* ]]; then
+          if [ -n "$time_file" ]; then
+            printf '%s\n' "$msg" > "$time_file"
+          fi
+        fi
+        log_info "$msg"
+        ;;
+      \[WARN\]*)
+        local msg="${stripped#\[WARN\]}"
+        msg="${msg# }"
+        log_warn "$msg"
+        ;;
+      \[ERROR\]*|\[ERR\]*)
+        local msg="$stripped"
+        if [[ "$msg" == \[ERROR\]* ]]; then
+          msg="${msg#\[ERROR\]}"
+        else
+          msg="${msg#\[ERR\]}"
+        fi
+        msg="${msg# }"
+        log_error "$msg"
+        ;;
       Saved:*)
         log_info "$stripped"
         ;;
-      Updating\ device\ list|Created\ history\ step*|Blender\ *|Read\ blend:*|Time:*Saving:*)
+      Updating\ device\ list|Created\ history\ step*|Blender\ *|Read\ blend:*)
+        log_info "$stripped"
+        ;;
+      Time:*)
+        if [ -n "$time_file" ]; then
+          printf '%s\n' "$stripped" > "$time_file"
+        fi
         log_info "$stripped"
         ;;
       Fra:*)
@@ -188,14 +277,15 @@ command -v wslpath >/dev/null 2>&1 || die "wslpath not found. Run under WSL."
 # Base stage count matches the documented pipeline steps (preview, DINO, final composite).
 TOTAL_STEPS=3
 
+WIN_BLEND_FILE="$(wslpath -w "$PWD/$BLEND_FILE")"
+
 # ----- Step 1: Preview render in Windows Blender -----
 STEP=1
 log_step "${STEP}/${TOTAL_STEPS}" "Rendering preview via Windows Blender..."
 
 # Convert Linux paths to Windows for Blender.exe invocation
-WIN_BLEND_FILE="$(wslpath -w "$PWD/$BLEND_FILE")"
 WIN_PREVIEW_SCRIPT="$(wslpath -w "$PWD/$PREVIEW_SCRIPT")"
-BLENDER_ARGS=(--addons cycles)
+BLENDER_ARGS=(--factory-startup --addons cycles)
 if [ -n "${SCDL_CYCLES_DEVICE:-}" ]; then
   log_info "SCDL_CYCLES_DEVICE=${SCDL_CYCLES_DEVICE}"
 else
@@ -207,7 +297,10 @@ if [ -n "${SCDL_CYCLES_DEVICE:-}" ]; then
   PREVIEW_CMD+=(-- --cycles-device "${SCDL_CYCLES_DEVICE}")
 fi
 log_cmd_array "${PREVIEW_CMD[@]}"
+: > "$BLENDER_TIME_FILE"
+_step_start=$(date +%s)
 run_blender_cmd "${PREVIEW_CMD[@]}" || die "Blender preview step failed."
+record_step_duration "Preview render" $(( $(date +%s) - _step_start ))
 
 # Verify preview
 [ -f out/preview.png ]   || die "Missing out/preview.png after Blender preview."
@@ -220,7 +313,10 @@ log_step "${STEP}/${TOTAL_STEPS}" "Computing DINO mask in WSL..."
 export SCDL_PROJECT_DIR="$PWD"
 DINO_CMD=(conda run -n scdl-foveated python "$WSL_DINO_SCRIPT")
 log_cmd_array "${DINO_CMD[@]}"
+: > "$BLENDER_TIME_FILE"
+_step_start=$(date +%s)
 "${DINO_CMD[@]}" || die "DINO mask step failed."
+record_step_duration "DINO mask" $(( $(date +%s) - _step_start ))
 [ -f out/user_importance.npy ] || die "Missing out/user_importance.npy after DINO."
 
 
@@ -233,7 +329,10 @@ if [ -n "${SCDL_CYCLES_DEVICE:-}" ]; then
   FINAL_CMD+=(-- --cycles-device "${SCDL_CYCLES_DEVICE}")
 fi
 log_cmd_array "${FINAL_CMD[@]}"
+: > "$BLENDER_TIME_FILE"
+_step_start=$(date +%s)
 run_blender_cmd "${FINAL_CMD[@]}" || die "Blender final (ROI) step failed."
+record_step_duration "Final render" $(( $(date +%s) - _step_start ))
 
 # Verify final output
 [ -f out/final.png ] || die "Final render not found at out/final.png"
@@ -249,4 +348,29 @@ if [ "${#OUTPUT_PATHS[@]}" -gt 0 ]; then
   log_done "Outputs: ${_outputs_str}"
 else
   log_done "Pipeline finished with no outputs tracked."
+fi
+
+if [ "${#STEP_NAMES[@]}" -gt 0 ]; then
+  log_info "Timing summary:"
+  total_duration=$(( $(date +%s) - PIPELINE_START ))
+  for idx in "${!STEP_NAMES[@]}"; do
+    step_name="${STEP_NAMES[$idx]}"
+    step_secs="${STEP_DURATIONS[$idx]}"
+    step_report="${STEP_REPORTED_TIMES[$idx]}"
+    local_line="  ${step_name}: $(format_duration "$step_secs")"
+    if [ -n "$step_report" ]; then
+      case "$step_report" in
+        Time:*)
+          extract="${step_report#Time: }"
+          extract="${extract%% *}"
+          local_line+=" (Blender: $extract)"
+          ;;
+        *)
+          local_line+=" ($step_report)"
+          ;;
+      esac
+    fi
+    log_info "$local_line"
+  done
+  log_info "  Total: $(format_duration "$total_duration")"
 fi
