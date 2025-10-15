@@ -3,7 +3,6 @@
 ## Overview
 This repository hosts a hybrid Windows/WSL rendering pipeline that produces a saliency-guided foveated render in a single pass. Blender (running on Windows) generates a fast preview, and WSL computes a DINO-based importance map from it. A final, efficient render pass in Blender then uses this mask to vary rendering quality across the image, focusing detail on important regions without needing to composite multiple images.
 
-*(Note: The `pipeline.md` file describes a previous, deprecated version of this pipeline.)*
 
 ## Installation
 
