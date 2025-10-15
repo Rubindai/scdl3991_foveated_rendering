@@ -41,6 +41,11 @@ else
 fi
 mkdir -p "$OUT_DIR"
 
+if [ "${CONDA_DEFAULT_ENV:-}" != "scdl-foveated" ]; then
+  printf '[ERROR] Activate the scdl-foveated conda env before running (CONDA_DEFAULT_ENV=%s).\n' "${CONDA_DEFAULT_ENV:-none}" >&2
+  exit 1
+fi
+
 PIPELINE_START=$(date +%s)
 declare -a STEP_NAMES=()
 declare -a STEP_DURATIONS=()
@@ -309,9 +314,19 @@ record_step_duration "Preview render" $(( $(date +%s) - _step_start ))
 STEP=$((STEP + 1))
 log_step "${STEP}/${TOTAL_STEPS}" "Computing DINO mask in WSL..."
 
+: > "$BLENDER_TIME_FILE"
 # Ensure the Python scripts resolve project paths to this repo
 export SCDL_PROJECT_DIR="$PWD"
-DINO_CMD=(conda run -n scdl-foveated python "$WSL_DINO_SCRIPT")
+export PYTHONNOUSERSITE=1
+export PYTHONWARNINGS="default"
+
+if [ -n "${SCDL_DINO_PYTHON:-}" ]; then
+  DINO_CMD=("${SCDL_DINO_PYTHON}" "$WSL_DINO_SCRIPT")
+  log_info "Using explicit SCDL_DINO_PYTHON=${SCDL_DINO_PYTHON}"
+else
+  DINO_CMD=(python "$WSL_DINO_SCRIPT")
+fi
+
 log_cmd_array "${DINO_CMD[@]}"
 : > "$BLENDER_TIME_FILE"
 _step_start=$(date +%s)
@@ -320,7 +335,7 @@ record_step_duration "DINO mask" $(( $(date +%s) - _step_start ))
 [ -f out/user_importance.npy ] || die "Missing out/user_importance.npy after DINO."
 
 
-# ----- Step 3: ROI + composite in Windows Blender -----
+# ----- Step 3: Single-pass foveated render in Windows Blender -----
 STEP=$((STEP + 1))
 log_step "${STEP}/${TOTAL_STEPS}" "Rendering final image (single-pass foveated) in Windows Blender..."
 WIN_FINAL_SCRIPT="$(wslpath -w "$PWD/$FINAL_SCRIPT")"
@@ -331,7 +346,7 @@ fi
 log_cmd_array "${FINAL_CMD[@]}"
 : > "$BLENDER_TIME_FILE"
 _step_start=$(date +%s)
-run_blender_cmd "${FINAL_CMD[@]}" || die "Blender final (ROI) step failed."
+run_blender_cmd "${FINAL_CMD[@]}" || die "Blender final step failed."
 record_step_duration "Final render" $(( $(date +%s) - _step_start ))
 
 # Verify final output
