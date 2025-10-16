@@ -13,11 +13,14 @@
 # - Optional extra debug outputs:
 #     SCDL_SAVE_ATTENTION=1 → out/attention_mask.png
 #     SCDL_SAVE_FOVEATED=1  → out/foveated_preview.png
+# - Choose the backbone with SCDL_DINO_ARCH (vitl16|vits16); defaults to ViT-L/16.
+# - Automatic mixed precision on CUDA when SCDL_MASK_AMP=1 (default).
 
 from __future__ import annotations
 
 import os
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 
 os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
@@ -41,11 +44,31 @@ PROJECT_DIR = PATHS.project_dir
 OUT_DIR = PATHS.out_dir
 PREVIEW_PATH = PATHS.preview
 
+# DINOv3 architecture selection + assets
+_ARCH_ALIASES = {
+    "vitl16": "vitl16",
+    "large": "vitl16",
+    "l": "vitl16",
+    "vits16": "vits16",
+    "small": "vits16",
+    "s": "vits16",
+}
+DINO_ARCH_RAW = os.environ.get("SCDL_DINO_ARCH", "vitl16").strip().lower()
+DINO_ARCH = _ARCH_ALIASES.get(DINO_ARCH_RAW, "vitl16")
+DINO_HUB_ENTRY = {
+    "vitl16": "dinov3_vitl16",
+    "vits16": "dinov3_vits16",
+}[DINO_ARCH]
+_DEFAULT_WEIGHTS = {
+    "vitl16": PROJECT_DIR / "dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth",
+    "vits16": PROJECT_DIR / "dinov3_vits16_pretrain_lvd1689m-08c60483.pth",
+}
+
 # DINOv3 local clone + weights
 REPO_DIR = env_path("SCDL_DINO_REPO", PROJECT_DIR / "dinov3", base=PROJECT_DIR)
 WEIGHT_PATH = env_path(
     "SCDL_DINO_WEIGHTS",
-    PROJECT_DIR / "dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth",
+    _DEFAULT_WEIGHTS[DINO_ARCH],
     base=PROJECT_DIR,
 )
 
@@ -64,6 +87,8 @@ def fail(msg: str, code: int = 1):
     LOGGER.error(msg)
     sys.exit(code)
 
+USE_AMP = torch.cuda.is_available() and int(os.environ.get("SCDL_MASK_AMP", "1")) != 0
+
 
 # ---- Preprocess (no resize here; we letterbox manually) ----
 def _make_preprocess():
@@ -74,8 +99,8 @@ def _make_preprocess():
     ])
 
 
-# ---- Load DINOv3 ViT-L/16 via the repo's torch.hub entrypoint ----
-def load_dinov3_vitl16(repo_dir: Path, weight_path: Path, device=None):
+# ---- Load DINOv3 model via the repo's torch.hub entrypoint ----
+def load_dinov3_model(repo_dir: Path, hub_entry: str, weight_path: Path, device=None):
     if not repo_dir.exists():
         fail(
             f"[DINO] Missing repo at {repo_dir}. Set SCDL_DINO_REPO to your local clone of facebookresearch/dinov3.")
@@ -86,12 +111,12 @@ def load_dinov3_vitl16(repo_dir: Path, weight_path: Path, device=None):
     preprocess = _make_preprocess()
 
     try:
-        model = torch.hub.load(str(repo_dir), 'dinov3_vitl16',
+        model = torch.hub.load(str(repo_dir), hub_entry,
                                source='local', weights=str(weight_path))
     except Exception as e:
         fail(f"[DINO] torch.hub.load failed (repo={repo_dir}): {e}")
 
-    # Quick structure sanity check for DINOv3 ViT-S
+    # Quick structure sanity check for DINOv3 ViT models
     model.eval().to(device)
     return model, preprocess, device
 
@@ -196,16 +221,28 @@ def make_attention_map_from_cls_similarity(patch_tokens: torch.Tensor,
 
 
 # ---- USER core: single-scale attention on letterboxed image ----
+def _use_amp_for_device(device: torch.device | str, requested: bool) -> bool:
+    if not requested:
+        return False
+    dev_str = str(device)
+    return torch.cuda.is_available() and dev_str.startswith("cuda")
+
+
 @torch.no_grad()
 def _user_saliency_single_scale(img_np_hw3: np.ndarray, model, preprocess, device,
-                                out_wh, size: int = 336):
+                                out_wh, size: int = 336, *, use_amp: bool = False):
     img_let, meta = _resize_letterbox(img_np_hw3, size=size)
     x = preprocess(img_let).unsqueeze(0).to(device)  # [1,3,size,size]
-    patch_tokens, cls_token, H_p, W_p, _ = get_patch_tokens_and_cls(
-        model, x, patch_size=PATCH_SIZE)
-    attn = make_attention_map_from_cls_similarity(
-        patch_tokens, cls_token, H_p, W_p)
-    attn = _normalize01(attn)
+    amp_ctx = nullcontext()
+    if _use_amp_for_device(device, use_amp):
+        amp_ctx = torch.cuda.amp.autocast(dtype=torch.float16)
+    with amp_ctx:
+        patch_tokens, cls_token, H_p, W_p, _ = get_patch_tokens_and_cls(
+            model, x, patch_size=PATCH_SIZE)
+        attn = make_attention_map_from_cls_similarity(
+            patch_tokens, cls_token, H_p, W_p)
+        attn = _normalize01(attn)
+    attn = attn.float()
 
     # Optional smoothing + gamma (keep existing knobs)
     k = max(1, int(os.environ.get("SCDL_MASK_SMOOTH_K", "1")))
@@ -231,6 +268,7 @@ def _user_saliency_single_scale(img_np_hw3: np.ndarray, model, preprocess, devic
 def dense_feature_importance_mask(img_np_hw3: np.ndarray, model, preprocess, device, out_wh):
     """Compute saliency/importance. Default: use USER method; set SCDL_MASK_CORE=builtin to revert."""
     core = os.environ.get("SCDL_MASK_CORE", "user").strip().lower()
+    amp_enabled = _use_amp_for_device(device, USE_AMP)
 
     if core == "builtin":
         # Previous implementation: fuse multiple sizes via intermediate layers
@@ -240,10 +278,11 @@ def dense_feature_importance_mask(img_np_hw3: np.ndarray, model, preprocess, dev
         maps = []
         for sz in sizes:
             maps.append(_user_saliency_single_scale(
-                img_np_hw3, model, preprocess, device, out_wh, size=sz))
+                img_np_hw3, model, preprocess, device, out_wh, size=sz, use_amp=amp_enabled))
         sal = maps[0] if len(maps) == 1 else torch.stack(
             maps, dim=0).mean(dim=0)
-        return _normalize01(sal).detach().cpu().numpy().astype(np.float32)
+        sal = _normalize01(sal)
+        return sal.detach().cpu().numpy().astype(np.float32)
 
     # USER path (default)
     # Default to a single high-resolution scale for efficiency. For higher quality,
@@ -255,7 +294,7 @@ def dense_feature_importance_mask(img_np_hw3: np.ndarray, model, preprocess, dev
     maps = []
     for sz in sizes:
         maps.append(_user_saliency_single_scale(
-            img_np_hw3, model, preprocess, device, out_wh, size=sz))
+            img_np_hw3, model, preprocess, device, out_wh, size=sz, use_amp=amp_enabled))
     sal = maps[0] if len(maps) == 1 else torch.stack(maps, dim=0).mean(dim=0)
     sal = _normalize01(sal)
     return sal.detach().cpu().numpy().astype(np.float32)
@@ -400,7 +439,13 @@ def main():
         img = img[:, :, :3]
     H, W = img.shape[:2]
 
-    model, preprocess, device = load_dinov3_vitl16(REPO_DIR, WEIGHT_PATH)
+    model, preprocess, device = load_dinov3_model(REPO_DIR, DINO_HUB_ENTRY, WEIGHT_PATH)
+    log_info(f"[DINO] Using architecture '{DINO_ARCH}' (hub entry '{DINO_HUB_ENTRY}').")
+    if _use_amp_for_device(device, USE_AMP):
+        log_info("[DINO] Mixed precision enabled (torch.cuda.amp autocast).")
+    else:
+        reason = "device is not CUDA" if not str(device).startswith("cuda") else "SCDL_MASK_AMP=0"
+        log_info(f"[DINO] Mixed precision disabled ({reason}).")
 
     # ------- Build saliency mask (now via USER attention by default) -------
     mask = dense_feature_importance_mask(

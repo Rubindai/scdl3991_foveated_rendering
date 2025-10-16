@@ -333,6 +333,7 @@ _step_start=$(date +%s)
 "${DINO_CMD[@]}" || die "DINO mask step failed."
 record_step_duration "DINO mask" $(( $(date +%s) - _step_start ))
 [ -f out/user_importance.npy ] || die "Missing out/user_importance.npy after DINO."
+[ -f out/fovea_mask.exr ] || die "Missing out/fovea_mask.exr after DINO."
 
 
 # ----- Step 3: Single-pass foveated render in Windows Blender -----
