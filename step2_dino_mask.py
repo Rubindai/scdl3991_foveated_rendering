@@ -18,8 +18,6 @@ from __future__ import annotations
 
 import os
 import sys
-import heapq
-import contextlib
 from pathlib import Path
 
 os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
@@ -54,7 +52,6 @@ WEIGHT_PATH = env_path(
 # Outputs
 MASK_NPY = PATHS.mask_npy
 MASK_PREVIEW = PATHS.mask_preview
-ROI_BBOX_TXT = PATHS.roi_bbox
 LOGGER = get_logger("scdl_step2", PATHS.log_file)
 
 
@@ -390,78 +387,6 @@ def refine_with_watershed(img_rgb: np.ndarray, prob: np.ndarray):
     return refined.astype(np.float32)
 
 
-# ---- Compact single-object ROI (seeded growth) ----
-def seeded_compact_roi(sal: np.ndarray, target_area: float, connectivity: int = 8):
-    """Grow a single connected region from the global maximum until budget is met."""
-    H, W = sal.shape
-    budget = max(1, int(round(target_area * H * W)))
-    y0, x0 = np.unravel_index(int(np.argmax(sal)), sal.shape)
-
-    visited = np.zeros((H, W), dtype=bool)
-    mask = np.zeros((H, W), dtype=bool)
-    pq: list[tuple[float, int, int]] = []
-
-    def push(y, x):
-        if 0 <= y < H and 0 <= x < W and not visited[y, x]:
-            visited[y, x] = True
-            heapq.heappush(pq, (-float(sal[y, x]), y, x))
-
-    visited[y0, x0] = True
-    mask[y0, x0] = True
-    count = 1
-    nbrs4 = [(1, 0), (-1, 0), (0, 1), (0, -1)]
-    nbrs8 = nbrs4 + [(1, 1), (1, -1), (-1, 1), (-1, -1)]
-    nbrs = nbrs8 if connectivity == 8 else nbrs4
-    for dy, dx in nbrs:
-        push(y0 + dy, x0 + dx)
-
-    while count < budget and pq:
-        _, y, x = heapq.heappop(pq)
-        if mask[y, x]:
-            continue
-        mask[y, x] = True
-        count += 1
-        for dy, dx in nbrs:
-            push(y + dy, x + dx)
-
-    return mask
-
-
-# ---- Best fixed-area rectangle over saliency (fast) ----
-def best_saliency_rectangle(sal: np.ndarray, area_frac: float, aspects=(1.0,), stride: int | None = None):
-    H, W = sal.shape
-    A = int(round(area_frac * H * W))
-    if A <= 0:
-        return 0, H, 0, W
-    stride = max(1, int(stride) if stride else max(1, int(min(H, W) * 0.01)))
-
-    best = None
-    for ar in aspects:
-        h = int(round((A / ar) ** 0.5))
-        w = int(round(ar * h))
-        if h <= 0 or w <= 0:
-            continue
-        if h > H or w > W:
-            continue
-        ii = sal.cumsum(axis=0).cumsum(axis=1)
-        for y0 in range(0, H - h + 1, stride):
-            y1 = y0 + h
-            row = ii[y1 - 1]
-            row0 = ii[y0 - 1] if y0 > 0 else 0
-            for x0 in range(0, W - w + 1, stride):
-                x1 = x0 + w
-                s = row[x1 - 1] - (row[x0 - 1] if x0 > 0 else 0)
-                if y0 > 0:
-                    s -= ii[y0 - 1][x1 - 1] - \
-                        (ii[y0 - 1][x0 - 1] if x0 > 0 else 0)
-                if (best is None) or (s > best[0]):
-                    best = (float(s), y0, y1, x0, x1)
-    if best is None:
-        return 0, H, 0, W
-    _, y0, y1, x0, x1 = best
-    return y0, y1, x0, x1
-
-
 def main():
     if not PREVIEW_PATH.exists():
         fail(
@@ -605,46 +530,6 @@ def main():
         fpath = OUT_DIR / "foveated_preview.png"
         iio.imwrite(fpath, (out.mul(255).byte().permute(1, 2, 0).numpy()))
         log_info(f"[OK] Saved foveated preview: {fpath}")
-
-    # ------- ROI selection & bbox -------
-    area = float(os.environ.get("SCDL_ROI_AREA", "0.15"))
-    area = max(0.01, min(0.95, area))
-
-    roi_mode = os.environ.get("SCDL_ROI_MODE", "seeded").lower()
-    if roi_mode == "seeded":
-        binary = seeded_compact_roi(mask, area, connectivity=int(
-            os.environ.get("SCDL_ROI_CONNECTIVITY", "8")))
-        # optional dilation to bridge gaps
-        dil_iter = int(os.environ.get("SCDL_ROI_DILATE", "2"))
-        try:
-            import scipy.ndimage as ndi  # type: ignore
-            if dil_iter > 0:
-                binary = ndi.binary_dilation(binary, iterations=dil_iter)
-        except Exception:
-            pass
-        ys, xs = np.where(binary)
-        if xs.size == 0:
-            nx0 = ny0 = 0.0
-            nx1 = ny1 = 1.0
-        else:
-            min_x, max_x = int(xs.min()), int(xs.max())
-            min_y, max_y = int(ys.min()), int(ys.max())
-            nx0, nx1 = min_x / W, (max_x + 1) / W
-            ny0, ny1 = min_y / H, (max_y + 1) / H
-    else:
-        aspects_str = os.environ.get(
-            "SCDL_ROI_ASPECTS", "0.5,0.75,1.0,1.25,1.6,2.0,2.5")
-        aspects = tuple(float(s) for s in aspects_str.split(",") if s.strip())
-        stride = os.environ.get("SCDL_ROI_STRIDE")
-        stride = int(stride) if stride and stride.isdigit() else None
-        y0, y1, x0, x1 = best_saliency_rectangle(
-            mask, area, aspects=aspects, stride=stride)
-        nx0, nx1 = x0 / W, x1 / W
-        ny0, ny1 = y0 / H, y1 / H
-
-    ROI_BBOX_TXT.write_text(f"{nx0} {nx1} {ny0} {ny1}\n")
-    log_info(f"[OK] ROI bbox saved → {ROI_BBOX_TXT}  area≈{area*100:.1f}%")
-
 
 if __name__ == "__main__":
     main()

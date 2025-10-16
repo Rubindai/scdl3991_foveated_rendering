@@ -34,6 +34,7 @@ LOGGER = get_logger("scdl_step3_singlepass", PATHS.log_file)
 
 # Read config from environment variables, consistent with other scripts
 _ENV_CACHE: dict[str, str] | None = None
+_ENV_SENTINEL = "__SCDL_UNSET__"
 
 
 def _get_env_value(key: str, default: str) -> str:
@@ -57,16 +58,22 @@ def _get_env_value(key: str, default: str) -> str:
     return _ENV_CACHE.get(key, default)
 
 
-ADAPTIVE_THRESHOLD = float(_get_env_value("SCDL_ROI_CYCLES_THRESHOLD", "0.03"))
-BASE_SAMPLES = int(_get_env_value("SCDL_BASE_CYCLES_SPP", "256"))
-ROI_SAMPLES = int(_get_env_value("SCDL_ROI_CYCLES_SPP", str(max(BASE_SAMPLES, 512))))
-MIN_SAMPLES = int(_get_env_value("SCDL_ROI_ADAPTIVE_MIN_SAMPLES", "32"))
+def _get_env_fallback(primary: str, legacy: str, default: str) -> str:
+    value = _get_env_value(primary, _ENV_SENTINEL)
+    if value != _ENV_SENTINEL:
+        return value
+    return _get_env_value(legacy, default)
+
+
+ADAPTIVE_THRESHOLD = float(_get_env_fallback("SCDL_ADAPTIVE_THRESHOLD", "SCDL_ROI_CYCLES_THRESHOLD", "0.03"))
+BASE_SAMPLES = int(_get_env_fallback("SCDL_FOVEATED_BASE_SPP", "SCDL_BASE_CYCLES_SPP", "256"))
+PEAK_SAMPLES = int(_get_env_fallback("SCDL_FOVEATED_MAX_SPP", "SCDL_ROI_CYCLES_SPP", str(max(BASE_SAMPLES, 512))))
+MIN_SAMPLES = int(_get_env_fallback("SCDL_FOVEATED_MIN_SPP", "SCDL_ROI_ADAPTIVE_MIN_SAMPLES", "32"))
 CYCLES_DEVICE = _get_env_value("SCDL_CYCLES_DEVICE", "CPU")
-AUTO_SPP = int(_get_env_value("SCDL_FOVEATED_AUTOSPP", "1")) != 0
+AUTOSPP_ENABLED = int(_get_env_value("SCDL_FOVEATED_AUTOSPP", "1")) != 0
 
 # --- Constants ---
 FOVEATION_GROUP_NAME = "FoveationMixer"
-SIMPLIFIED_SUFFIX = "_simplified"
 
 def log_info(msg: str): LOGGER.info(msg)
 def log_warn(msg: str): LOGGER.warning(msg)
@@ -79,6 +86,48 @@ def fail(msg: str, code: int = 1):
 def _format_duration(seconds: float) -> str:
     minutes, secs = divmod(seconds, 60.0)
     return f"{int(minutes):02d}:{secs:05.2f}"
+
+
+def _configure_best_denoiser(cycles: bpy.types.CyclesSettings, device_hint: str) -> None:
+    """Select the fastest denoiser available for the active compute device."""
+
+    try:
+        available = {item.identifier for item in cycles.bl_rna.properties["denoiser"].enum_items}
+    except Exception:
+        available = set()
+
+    normalized_hint = (device_hint or "").strip().upper()
+    try:
+        runtime_device = getattr(cycles, "device", "").strip().upper()
+    except Exception:
+        runtime_device = ""
+
+    if not normalized_hint:
+        normalized_hint = runtime_device
+
+    preferred: list[str] = []
+    if normalized_hint in {"GPU", "CUDA", "OPTIX"}:
+        preferred.append("OPTIX")
+    preferred.append("OPENIMAGEDENOISE")
+    preferred.extend(["AUTO", "DEFAULT"])
+
+    for candidate in preferred:
+        if candidate not in available:
+            continue
+        try:
+            cycles.denoiser = candidate
+            log_info(f"Configured Cycles denoiser → {candidate}")
+            return
+        except Exception as exc:
+            log_warn(f"Could not set denoiser '{candidate}': {exc}")
+
+    if available:
+        fallback = next(iter(available))
+        log_warn(f"Falling back to available denoiser '{fallback}'.")
+        try:
+            cycles.denoiser = fallback
+        except Exception:
+            pass
 
 def create_foveated_mixer_group(mask_image):
     """
@@ -180,14 +229,11 @@ def main():
     # 2. Configure Cycles for single-pass adaptive sampling
     cycles.use_adaptive_sampling = True
     cycles.adaptive_threshold = ADAPTIVE_THRESHOLD
-    cycles.samples = ROI_SAMPLES
+    cycles.samples = PEAK_SAMPLES
     cycles.adaptive_min_samples = min(MIN_SAMPLES, cycles.samples)
 
     cycles.use_denoising = True
-    try:
-        cycles.denoiser = 'OPENIMAGEDENOISE'  # OIDN generally good and CPU-friendly
-    except Exception:
-        pass
+    _configure_best_denoiser(cycles, CYCLES_DEVICE)
 
     # Enable denoising on view layers and store guiding passes (albedo/normal)
     for vl in scene.view_layers:
@@ -229,17 +275,17 @@ def main():
     if mask_image is None:
         fail("No usable foveation mask found. Expected fovea_mask.exr from Step 2.")
 
-    if AUTO_SPP:
+    if AUTOSPP_ENABLED:
         try:
             coverage = _estimate_mask_coverage(mask_image)
-            target_spp = int(round(BASE_SAMPLES + (ROI_SAMPLES - BASE_SAMPLES) * coverage))
-            target_spp = max(MIN_SAMPLES, min(ROI_SAMPLES, max(BASE_SAMPLES, target_spp)))
+            target_spp = int(round(BASE_SAMPLES + (PEAK_SAMPLES - BASE_SAMPLES) * coverage))
+            target_spp = max(MIN_SAMPLES, min(PEAK_SAMPLES, max(BASE_SAMPLES, target_spp)))
             cycles.samples = target_spp
             cycles.adaptive_min_samples = min(cycles.samples, MIN_SAMPLES)
             log_info(f"Auto SPP enabled → mask coverage={coverage:.3f}, samples={cycles.samples}")
         except Exception as exc:
-            log_warn(f"Auto SPP failed ({exc}); falling back to ROI_SAMPLES={ROI_SAMPLES}")
-            cycles.samples = ROI_SAMPLES
+            log_warn(f"Auto SPP failed ({exc}); falling back to PEAK_SAMPLES={PEAK_SAMPLES}")
+            cycles.samples = PEAK_SAMPLES
             cycles.adaptive_min_samples = min(MIN_SAMPLES, cycles.samples)
 
     # 4. Create or get the Foveated Mixer node group

@@ -19,7 +19,6 @@ class PipelinePaths:
     final: Path
     mask_npy: Path
     mask_preview: Path
-    roi_bbox: Path
     log_file: Path
 
 
@@ -49,7 +48,6 @@ def get_pipeline_paths(default_root: Optional[Path] = None) -> PipelinePaths:
     final = out_dir / "final.png"
     mask_npy = out_dir / "user_importance.npy"
     mask_preview = out_dir / "user_importance_preview.png"
-    roi_bbox = out_dir / "roi_bbox.txt"
     log_file = out_dir / "scdl_pipeline.log"
     return PipelinePaths(
         project_dir=project_dir,
@@ -58,7 +56,6 @@ def get_pipeline_paths(default_root: Optional[Path] = None) -> PipelinePaths:
         final=final,
         mask_npy=mask_npy,
         mask_preview=mask_preview,
-        roi_bbox=roi_bbox,
         log_file=log_file,
     )
 

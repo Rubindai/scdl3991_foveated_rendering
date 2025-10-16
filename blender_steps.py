@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 # blender_steps.py
-# Purpose: Run inside Windows Blender to perform step1 preview OR step3 ROI+composite,
-# selected via the env var SCDL_BLEND_STEP={preview|final}.
+# Purpose: Run inside Windows Blender to perform Step 1 (preview) render.
 
 import os
 import bpy
@@ -206,7 +205,7 @@ def main():
     if step in ('preview', 'step1', '1'):
         render_preview()
     else:
-        log_warn(f"[WARN] Unknown SCDL_BLEND_STEP={step}; defaulting to 'preview'. Supported value is 'preview'.")
+        log_warn(f"[WARN] Unknown SCDL_BLEND_STEP={step}; this helper only supports 'preview'.")
         render_preview()
 
 

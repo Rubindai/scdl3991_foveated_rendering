@@ -17,7 +17,6 @@ This step runs in the WSL Conda environment. It uses the DINOv3 model to analyze
     -   `out/user_importance.npy`: The raw, numeric importance mask. Used for debugging.
     -   `out/user_importance_preview.png`: A visual representation of the raw mask for sanity checks.
     -   `out/fovea_mask.exr`: **(New)** A blurred, 32-bit float EXR version of the mask. This is the primary input for the final rendering step.
-    -   `out/roi_bbox.txt`: The bounding box of the most salient region. (Note: This is no longer used by the rendering pipeline but is still generated).
 -   **Script**: `step2_dino_mask.py`.
 
 ### 3. Single-Pass Foveated Render → `out/final.png`
@@ -28,7 +27,7 @@ This is the new, highly efficient final rendering step. It replaces the old meth
     1.  The `fovea_mask.exr` is loaded into Blender as a texture.
     2.  A special node group (`FoveationMixer`) is programmatically inserted into every material in the scene.
     3.  This node group uses the mask (mapped to the screen) to blend between the material's original, high-quality shader and a simplified, low-variance version.
-    4.  The simplified shader (e.g., with higher roughness and no transmission) produces less noise. The adaptive sampler detects this, stops sampling the unimportant pixels early, and focuses effort on the important regions.
+    4.  The simplified shader (e.g., with higher roughness and no transmission) produces less noise. The adaptive sampler detects this, stops sampling the unimportant pixels early, and focuses effort on the important regions. The script also selects the fastest denoiser available (OptiX on NVIDIA GPUs, OIDN otherwise).
 -   **Inputs**: Scene `.blend` file, `out/fovea_mask.exr`.
 -   **Output**: `out/final.png`.
 -   **Script**: `step3_singlepass_foveated.py`.
@@ -37,4 +36,4 @@ This is the new, highly efficient final rendering step. It replaces the old meth
 -   `out/preview.png`: Low-quality render for analysis.
 -   `out/fovea_mask.exr`: **Primary mask used for rendering.**
 -   `out/final.png`: The final, high-quality foveated render.
--   `out/user_importance.npy`, `out/user_importance_preview.png`, `out/roi_bbox.txt`: Debugging and visualization artifacts.
+-   `out/user_importance.npy`, `out/user_importance_preview.png`: Debugging and visualization artifacts.
