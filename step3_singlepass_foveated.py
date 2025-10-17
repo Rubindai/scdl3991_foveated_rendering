@@ -70,8 +70,7 @@ def _env_float(key: str, default: float) -> float:
     try:
         return float(raw)
     except Exception:
-        log_warn(f"Invalid float for {key}='{raw}', using {default}")
-        return float(default)
+        raise ValueError(f"Invalid float for {key}='{raw}'")
 
 
 def _env_float_optional(key: str) -> float | None:
@@ -84,8 +83,7 @@ def _env_float_optional(key: str) -> float | None:
     try:
         return float(raw)
     except Exception:
-        log_warn(f"Invalid float for {key}='{raw}', ignoring override.")
-        return None
+        raise ValueError(f"Invalid float for {key}='{raw}'")
 
 
 ADAPTIVE_THRESHOLD = float(_get_env_fallback("SCDL_ADAPTIVE_THRESHOLD", "SCDL_ROI_CYCLES_THRESHOLD", "0.03"))
@@ -94,9 +92,6 @@ PEAK_SAMPLES = int(_get_env_fallback("SCDL_FOVEATED_MAX_SPP", "SCDL_ROI_CYCLES_S
 MIN_SAMPLES = int(_get_env_fallback("SCDL_FOVEATED_MIN_SPP", "SCDL_ROI_ADAPTIVE_MIN_SAMPLES", "32"))
 CYCLES_DEVICE = _get_env_value("SCDL_CYCLES_DEVICE", "CPU")
 AUTOSPP_ENABLED = int(_get_env_value("SCDL_FOVEATED_AUTOSPP", "1")) != 0
-GUIDING_ENABLED = int(_get_env_value("SCDL_FOVEATED_GUIDING", "1")) != 0
-GUIDING_TRAINING = max(1, int(_get_env_value("SCDL_FOVEATED_GUIDING_TRAINING", "64")))
-GUIDING_DIRECTION = _get_env_value("SCDL_FOVEATED_GUIDING_MODE", "PATH_GUIDING").strip().upper()
 FILTER_GLOSSY_VALUE = _env_float("SCDL_FOVEATED_FILTER_GLOSSY", 0.5)
 SCRAMBLE_DISTANCE = _env_float_optional("SCDL_FOVEATED_SCRAMBLE_DISTANCE")
 CLAMP_DIRECT = _env_float_optional("SCDL_FOVEATED_CLAMP_DIRECT")
@@ -129,42 +124,12 @@ def _configure_best_denoiser(cycles: bpy.types.CyclesSettings, device_hint: str)
     """Select the fastest denoiser available for the active compute device."""
 
     try:
-        available = {item.identifier for item in cycles.bl_rna.properties["denoiser"].enum_items}
-    except Exception:
-        available = set()
-
-    normalized_hint = (device_hint or "").strip().upper()
-    try:
-        runtime_device = getattr(cycles, "device", "").strip().upper()
-    except Exception:
-        runtime_device = ""
-
-    if not normalized_hint:
-        normalized_hint = runtime_device
-
-    preferred: list[str] = []
-    if normalized_hint in {"GPU", "CUDA", "OPTIX"}:
-        preferred.append("OPTIX")
-    preferred.append("OPENIMAGEDENOISE")
-    preferred.extend(["AUTO", "DEFAULT"])
-
-    for candidate in preferred:
-        if candidate not in available:
-            continue
-        try:
-            cycles.denoiser = candidate
-            log_info(f"Configured Cycles denoiser → {candidate}")
-            return
-        except Exception as exc:
-            log_warn(f"Could not set denoiser '{candidate}': {exc}")
-
-    if available:
-        fallback = next(iter(available))
-        log_warn(f"Falling back to available denoiser '{fallback}'.")
-        try:
-            cycles.denoiser = fallback
-        except Exception:
-            pass
+        cycles.denoiser = "OPENIMAGEDENOISE"
+    except Exception as exc:
+        fail(f"Failed to set denoiser 'OPENIMAGEDENOISE': {exc}")
+    if getattr(cycles, "denoiser", None) != "OPENIMAGEDENOISE":
+        fail("OpenImageDenoise not active after assignment.")
+    log_info("Configured Cycles denoiser → OPENIMAGEDENOISE")
 
 def create_foveated_mixer_group(mask_image):
     """
@@ -261,7 +226,7 @@ def main():
             scene.cycles.device = 'CPU' if dev == 'CPU' else 'GPU'
             log_info(f"Set Cycles device to: {scene.cycles.device} (raw='{CYCLES_DEVICE}')")
     except Exception as exc:
-        log_warn(f"Could not configure Cycles device ('{CYCLES_DEVICE}'): {exc}")
+        fail(f"Could not configure Cycles device ('{CYCLES_DEVICE}'): {exc}")
 
     # 2. Configure Cycles for single-pass adaptive sampling
     cycles.use_adaptive_sampling = True
@@ -274,69 +239,52 @@ def main():
 
     try:
         cycles.blur_glossy = FILTER_GLOSSY_VALUE
-    except Exception:
-        pass
+    except Exception as exc:
+        fail(f"Failed to set filter glossy value: {exc}")
 
     if not CAUSTICS_ENABLED:
         try:
             cycles.caustics_reflective = False
             cycles.caustics_refractive = False
-        except Exception:
-            pass
+        except Exception as exc:
+            fail(f"Failed to disable caustics: {exc}")
 
     if CLAMP_DIRECT is not None:
         try:
             cycles.sample_clamp_direct = max(0.0, CLAMP_DIRECT)
             log_info(f"Clamped direct light samples → {cycles.sample_clamp_direct}")
         except Exception as exc:
-            log_warn(f"Could not set direct clamp: {exc}")
+            fail(f"Could not set direct clamp: {exc}")
     if CLAMP_INDIRECT is not None:
         try:
             cycles.sample_clamp_indirect = max(0.0, CLAMP_INDIRECT)
             log_info(f"Clamped indirect light samples → {cycles.sample_clamp_indirect}")
         except Exception as exc:
-            log_warn(f"Could not set indirect clamp: {exc}")
+            fail(f"Could not set indirect clamp: {exc}")
 
     if SCRAMBLE_DISTANCE is not None:
         try:
             cycles.scrambling_distance = max(0.0, SCRAMBLE_DISTANCE)
             log_info(f"Scrambling distance → {cycles.scrambling_distance}")
         except Exception as exc:
-            log_warn(f"Could not set scrambling distance: {exc}")
-
-    if GUIDING_ENABLED:
-        try:
-            cycles.use_guiding = True
-            if hasattr(cycles, "guiding_training_samples"):
-                cycles.guiding_training_samples = GUIDING_TRAINING
-            if hasattr(cycles, "guiding_distribution"):
-                valid_modes = {item.identifier for item in cycles.bl_rna.properties["guiding_distribution"].enum_items}
-                target = GUIDING_DIRECTION if GUIDING_DIRECTION in valid_modes else "PATH_GUIDING"
-                cycles.guiding_distribution = target
-            log_info(f"Path guiding enabled (training samples={GUIDING_TRAINING}, mode={cycles.guiding_distribution})")
-        except Exception as exc:
-            log_warn(f"Could not enable path guiding: {exc}")
-    else:
-        try:
-            cycles.use_guiding = False
-        except Exception:
-            pass
+            fail(f"Could not set scrambling distance: {exc}")
 
     # Enable denoising on view layers and store guiding passes (albedo/normal)
     for vl in scene.view_layers:
         try:
             vl.cycles.use_denoising = True
-        except Exception:
-            pass
+        except Exception as exc:
+            fail(f"Failed to enable denoising on view layer '{vl.name}': {exc}")
         try:
             vl.cycles.denoising_store_passes = True
-        except Exception:
-            pass
+        except Exception as exc:
+            fail(f"Failed to store denoising passes on view layer '{vl.name}': {exc}")
 
     # Global noise reduction settings
-    cycles.caustics_reflective = False
-    cycles.caustics_refractive = False
-    cycles.blur_glossy = 0.5 # Filter Glossy
+    if not CAUSTICS_ENABLED:
+        cycles.caustics_reflective = False
+        cycles.caustics_refractive = False
+    cycles.blur_glossy = FILTER_GLOSSY_VALUE # Filter Glossy
 
     log_info(f"Configured Cycles for adaptive sampling (threshold={cycles.adaptive_threshold}, min={cycles.adaptive_min_samples}, max={cycles.samples})")
 
@@ -357,7 +305,7 @@ def main():
             mask_image = img
             break
         except Exception as e:
-            log_warn(f"Failed to load mask at {mpath}: {e}")
+            fail(f"Failed to load mask at {mpath}: {e}")
 
     if mask_image is None:
         fail("No usable foveation mask found. Expected fovea_mask.exr from Step 2.")
@@ -371,9 +319,7 @@ def main():
             cycles.adaptive_min_samples = min(cycles.samples, MIN_SAMPLES)
             log_info(f"Auto SPP enabled → mask coverage={coverage:.3f}, samples={cycles.samples}")
         except Exception as exc:
-            log_warn(f"Auto SPP failed ({exc}); falling back to PEAK_SAMPLES={PEAK_SAMPLES}")
-            cycles.samples = PEAK_SAMPLES
-            cycles.adaptive_min_samples = min(MIN_SAMPLES, cycles.samples)
+            fail(f"Auto SPP failed: {exc}")
 
     # 4. Create or get the Foveated Mixer node group
     foveation_group = create_foveated_mixer_group(mask_image)
@@ -586,27 +532,25 @@ def main():
                     blur_output = blur_node.outputs['Image']
                     log_info(f"Compositor defocus enabled (fstop={fstop}, zscale={zscale}, max_blur={max_blur_px}).")
                 except Exception as exc:
-                    log_warn(f"Compositor Bokeh blur unavailable ({exc}); falling back to Gaussian blur.")
-                    blur_node = None
-                    blur_output = None
+                    fail(f"Compositor Bokeh blur unavailable: {exc}")
 
-            if blur_output is None:
+                if blur_output is None:
+                    fail("Compositor Bokeh blur did not produce output.")
+
+            else:
                 blur_px = int(round(max(0.0, _env_float("SCDL_DEFOCUS_MAXBLUR", 32.0))))
                 blur_node = nt.nodes.new('CompositorNodeBlur')
                 blur_node.location = Vector((-200, 200))
                 try:
                     blur_node.filter_type = 'GAUSS'
-                except Exception:
-                    pass
+                except Exception as exc:
+                    fail(f"Failed to configure Gaussian blur node: {exc}")
                 blur_node.use_relative = False
                 blur_node.size_x = blur_px
                 blur_node.size_y = blur_px
                 nt.links.new(n_rl.outputs['Image'], blur_node.inputs['Image'])
                 blur_output = blur_node.outputs['Image']
-                if focus_mode == "defocus":
-                    log_info(f"Compositor fallback blur enabled (gaussian, radius={blur_px}px).")
-                else:
-                    log_info(f"Compositor blur enabled (gaussian, radius={blur_px}px).")
+                log_info(f"Compositor blur enabled (gaussian, radius={blur_px}px).")
 
             n_mix = nt.nodes.new('CompositorNodeMixRGB')
             n_mix.location = Vector((200, 100))
@@ -640,12 +584,12 @@ def main():
                     nt.links.new(n_mix.outputs['Image'],   s_mix)
                     log_info("Compositor debug outputs enabled (mask/blur/mix).")
                 except Exception as exc:
-                    log_warn(f"Could not enable compositor debug outputs: {exc}")
+                    fail(f"Could not enable compositor debug outputs: {exc}")
 
             if focus_mode == "blur":
                 log_info("Compositor set: periphery blur enabled (gaussian mode).")
         except Exception as exc:
-            log_warn(f"Could not set compositor defocus: {exc}")
+            fail(f"Could not set compositor defocus: {exc}")
     elif focus_mode == "dof":
         # Optional: enable camera DOF if requested by env (depth-based bokeh)
         try:
@@ -657,8 +601,10 @@ def main():
                 dist = float(os.environ.get("SCDL_FOCUS_DISTANCE", "2.0"))
                 cam.dof.focus_distance = dist
                 log_info(f"Camera DOF enabled (fstop={fstop}, distance={dist}).")
+            else:
+                fail("Camera DOF requested but no camera or DOF controls available.")
         except Exception as exc:
-            log_warn(f"Could not configure camera DOF: {exc}")
+            fail(f"Could not configure camera DOF: {exc}")
     else:
         log_info("Focus mode off; skipping compositor blur.")
 

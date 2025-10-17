@@ -11,7 +11,7 @@ This project uses [Conda](https://docs.conda.io/en/latest/) to manage the Python
 1.  **Create the Conda Environment:**
     From the project root directory, run the following command to create the environment from the provided file:
     ```bash
-    conda env create -f environment.yml
+    conda env create --file environment.yml
     ```
 
 2.  **Activate the Environment:**
@@ -21,6 +21,12 @@ This project uses [Conda](https://docs.conda.io/en/latest/) to manage the Python
     ```
 
 This will install all the necessary Python dependencies (PyTorch, OpenCV, OpenEXR, etc.).
+
+Already have the environment set up? Keep it synchronized with the repo by running:
+
+```bash
+conda env update --file environment.yml --prune
+```
 
 ## Prerequisites
 - Windows Blender installation accessible from WSL.

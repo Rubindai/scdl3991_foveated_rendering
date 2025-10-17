@@ -201,20 +201,16 @@ def _parse_scale_weights(weights_str: str, count: int) -> torch.Tensor | None:
     if not tokens:
         return None
     if len(tokens) != count:
-        log_warn(f"[DINO] Ignoring SCDL_MASK_SCALE_WEIGHTS (expected {count} values, got {len(tokens)}).")
-        return None
+        fail(f"[DINO] SCDL_MASK_SCALE_WEIGHTS must provide {count} values (got {len(tokens)}).")
     try:
         weights = torch.tensor([float(tok) for tok in tokens], dtype=torch.float32)
     except ValueError:
-        log_warn("[DINO] Could not parse SCDL_MASK_SCALE_WEIGHTS as floats; ignoring.")
-        return None
+        fail("[DINO] Could not parse SCDL_MASK_SCALE_WEIGHTS as floats.")
     if torch.all(weights == 0):
-        log_warn("[DINO] Scale weights sum to zero; ignoring.")
-        return None
+        fail("[DINO] SCDL_MASK_SCALE_WEIGHTS must not sum to zero.")
     weights = torch.clamp(weights, min=0.0)
     if torch.all(weights == 0):
-        log_warn("[DINO] Scale weights are non-positive; ignoring.")
-        return None
+        fail("[DINO] SCDL_MASK_SCALE_WEIGHTS must contain positive values.")
     weights /= weights.sum()
     return weights
 
@@ -248,7 +244,7 @@ def _combine_scale_maps(maps: Sequence[torch.Tensor], mode: str, weights: torch.
         w = weights.to(stack.device).view(-1, 1, 1)
         return torch.sum(stack * w, dim=0)
     if mode not in {"mean", "weighted"}:
-        log_warn(f"[DINO] Unknown SCDL_MASK_REDUCE='{mode}', defaulting to mean.")
+        fail(f"[DINO] Unknown SCDL_MASK_REDUCE='{mode}'.")
     return stack.mean(dim=0)
 
 
@@ -393,7 +389,9 @@ def dense_feature_importance_mask(img_np_hw3: np.ndarray, model, preprocess, dev
             sizes = _auto_scale_list(height, width)
             sizes = [min(448, max(160, s)) for s in sizes]
         else:
-            sizes = _parse_scales(scales_str, hi=448) or [336]
+            sizes = _parse_scales(scales_str, hi=448)
+        if not sizes:
+            fail("[DINO] No valid scales configured for builtin saliency core.")
         weight_tensor: torch.Tensor | None = None
         if reduce_mode == "weighted":
             raw_weights = os.environ.get("SCDL_MASK_SCALE_WEIGHTS", "")
@@ -418,7 +416,9 @@ def dense_feature_importance_mask(img_np_hw3: np.ndarray, model, preprocess, dev
         sizes = _auto_scale_list(height, width)
         sizes = [min(768, max(160, s)) for s in sizes]
     else:
-        sizes = _parse_scales(scales_str, hi=768) or [448]
+        sizes = _parse_scales(scales_str, hi=768)
+    if not sizes:
+        fail("[DINO] No valid scales configured for saliency core.")
     weight_tensor: torch.Tensor | None = None
     if reduce_mode == "weighted":
         raw_weights = os.environ.get("SCDL_MASK_SCALE_WEIGHTS", "")
@@ -442,9 +442,8 @@ def refine_with_grabcut(img_rgb: np.ndarray, prob: np.ndarray, iters: int | None
         return prob
     try:
         import cv2
-    except Exception:
-        log_warn("[WARN] OpenCV not found; skipping GrabCut refinement.")
-        return prob
+    except Exception as exc:
+        fail(f"[DINO] OpenCV is required for GrabCut refinement but was not found ({exc}).")
 
     H, W = prob.shape
     lo_q = float(os.environ.get("SCDL_GC_LO_Q", "0.20"))
@@ -480,8 +479,11 @@ def refine_with_grabcut(img_rgb: np.ndarray, prob: np.ndarray, iters: int | None
     iters = max(1, int(iters))
     log_info(f"[DINO] GrabCut iterations → {iters}")
 
-    cv2.grabCut(img_rgb, mask, None, bgdModel,
-                fgdModel, iters, cv2.GC_INIT_WITH_MASK)
+    try:
+        cv2.grabCut(img_rgb, mask, None, bgdModel,
+                    fgdModel, iters, cv2.GC_INIT_WITH_MASK)
+    except Exception as exc:
+        fail(f"[DINO] GrabCut refinement failed: {exc}")
     fg = (mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD)
 
     out = prob.copy()
@@ -499,9 +501,8 @@ def refine_with_watershed(img_rgb: np.ndarray, prob: np.ndarray):
         return prob
     try:
         import cv2
-    except Exception:
-        log_warn("[WARN] OpenCV not found; skipping watershed refinement.")
-        return prob
+    except Exception as exc:
+        fail(f"[DINO] OpenCV is required for watershed refinement but was not found ({exc}).")
 
     if prob.ndim != 2 or prob.size == 0:
         return prob
@@ -550,8 +551,7 @@ def refine_with_watershed(img_rgb: np.ndarray, prob: np.ndarray):
     try:
         markers = cv2.watershed(img_bgr, markers)
     except Exception as exc:
-        log_warn(f"[WARN] Watershed failed ({exc}); skipping refinement.")
-        return prob
+        fail(f"[DINO] Watershed refinement failed: {exc}")
 
     seg = (markers == 2).astype(np.uint8)
     seg_close = max(0, int(os.environ.get("SCDL_WS_SEG_CLOSE", "0")))
@@ -643,63 +643,24 @@ def main():
     # Save the blurred mask as a float EXR file for Blender (fail hard otherwise)
     exr_path = OUT_DIR / "fovea_mask.exr"
     mask_float32 = mask.astype(np.float32)
-    def _save_exr_via_openexr() -> bool:
-        try:
-            import OpenEXR  # type: ignore
-            import Imath    # type: ignore
-        except Exception:
-            return False
-        try:
-            H, W = mask_float32.shape
-            header = OpenEXR.Header(W, H)
-            header['channels'] = {
-                'R': Imath.Channel(Imath.PixelType(Imath.PixelType.FLOAT))
-            }
-            exr_file = OpenEXR.OutputFile(str(exr_path), header)
-            exr_file.writePixels({'R': mask_float32.tobytes()})
-            exr_file.close()
-            log_info(f"[OK] Saved float EXR mask for Blender -> {exr_path}")
-            return True
-        except Exception as e:
-            log_error(f"Failed to save EXR via OpenEXR: {e}")
-            return False
+    try:
+        import OpenEXR  # type: ignore
+        import Imath    # type: ignore
+    except Exception as exc:
+        fail(f"OpenEXR bindings are required to write fovea_mask.exr ({exc}).")
 
-    def _save_exr_via_opencv() -> bool:
-        try:
-            import cv2  # type: ignore
-        except Exception:
-            return False
-        try:
-            ok = cv2.imwrite(str(exr_path), mask_float32)
-            if ok:
-                log_info(f"[OK] Saved EXR mask via OpenCV -> {exr_path}")
-            else:
-                log_warn("[WARN] OpenCV reported failure writing EXR mask.")
-            return bool(ok)
-        except Exception as e:
-            log_warn(f"[WARN] OpenCV could not write EXR ({e})")
-            return False
-
-    def _save_exr_via_imageio() -> bool:
-        try:
-            iio.imwrite(exr_path, mask_float32)
-            log_info(f"[OK] Saved EXR mask via imageio -> {exr_path}")
-            return True
-        except Exception as e:
-            log_warn(f"[WARN] imageio could not write EXR ({e})")
-            return False
-
-    wrote_exr = (
-        _save_exr_via_openexr()
-        or _save_exr_via_opencv()
-        or _save_exr_via_imageio()
-    )
-    if not wrote_exr:
-        fail(
-            "Failed to save fovea mask as EXR. "
-            "Ensure OpenEXR/python bindings are installed or enable OpenCV EXR support "
-            "(OPENCV_IO_ENABLE_OPENEXR=1)."
-        )
+    try:
+        H, W = mask_float32.shape
+        header = OpenEXR.Header(W, H)
+        header['channels'] = {
+            'R': Imath.Channel(Imath.PixelType(Imath.PixelType.FLOAT))
+        }
+        exr_file = OpenEXR.OutputFile(str(exr_path), header)
+        exr_file.writePixels({'R': mask_float32.tobytes()})
+        exr_file.close()
+        log_info(f"[OK] Saved float EXR mask for Blender -> {exr_path}")
+    except Exception as exc:
+        fail(f"Failed to save EXR via OpenEXR: {exc}")
 
     # Optional extra debug outputs
     if int(os.environ.get("SCDL_SAVE_ATTENTION", "0")):

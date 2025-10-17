@@ -39,21 +39,19 @@ LOGGER = get_logger("scdl_blender", OUT_DIR / "scdl_pipeline.log")
 def _ensure_cycles_addon():
     try:
         if getattr(bpy.app.build_options, "cycles", True) is False:
-            log_warn("[Engine] This Blender build has Cycles disabled at compile time.")
-            return
+            raise RuntimeError("[Engine] This Blender build has Cycles disabled at compile time.")
         prefs = getattr(bpy.context, "preferences", None)
         if prefs and 'cycles' in prefs.addons:
             return
         if addon_utils is None:
-            log_warn("[Engine] addon_utils unavailable; cannot auto-enable Cycles add-on.")
-            return
+            raise RuntimeError("[Engine] addon_utils unavailable; cannot auto-enable Cycles add-on.")
         try:
             addon_utils.enable("cycles", default_set=True)  # type: ignore[attr-defined]
             log_info("[Engine] Enabled Cycles add-on for this session.")
         except Exception as exc:
-            log_warn(f"[Engine] Could not enable Cycles add-on automatically: {exc}")
+            raise RuntimeError(f"[Engine] Could not enable Cycles add-on automatically: {exc}")
     except Exception as exc:
-        log_warn(f"[Engine] Failed to check Cycles availability: {exc}")
+        raise RuntimeError(f"[Engine] Failed to check Cycles availability: {exc}")
 
 
 def _configure_cycles_device(scene: bpy.types.Scene) -> None:
@@ -64,22 +62,19 @@ def _configure_cycles_device(scene: bpy.types.Scene) -> None:
     try:
         prefs_all = getattr(bpy.context, "preferences", None)
         if prefs_all is None:
-            log_warn("[Cycles] Preferences unavailable; cannot configure device.")
-            return
+            raise RuntimeError("[Cycles] Preferences unavailable; cannot configure device.")
         cycles_addon = prefs_all.addons.get('cycles')
         if cycles_addon is None:
-            log_warn("[Cycles] Cycles add-on preferences not found; device override skipped.")
-            return
+            raise RuntimeError("[Cycles] Cycles add-on preferences not found; device override skipped.")
         prefs = cycles_addon.preferences
     except Exception as exc:
-        log_warn(f"[Cycles] Could not access preferences: {exc}")
-        return
+        raise RuntimeError(f"[Cycles] Could not access preferences: {exc}")
 
     if desired_upper == 'CPU':
         try:
             scene.cycles.device = 'CPU'
         except Exception as exc:
-            log_warn(f"[Cycles] Failed to set CPU device: {exc}")
+            raise RuntimeError(f"[Cycles] Failed to set CPU device: {exc}")
         devices = prefs.get_devices()
         for dev_type, dev_list in devices:
             for dev in dev_list:
@@ -98,13 +93,12 @@ def _configure_cycles_device(scene: bpy.types.Scene) -> None:
         target_type = next((dt for dt in available_types if dt != 'CPU'), None)
 
     if not target_type:
-        log_warn(f"[Cycles] Requested device '{desired}' not available; options: {available_types}")
-        return
+        raise RuntimeError(f"[Cycles] Requested device '{desired}' not available; options: {available_types}")
 
     try:
         prefs.compute_device_type = target_type
     except Exception as exc:
-        log_warn(f"[Cycles] Failed to set compute device '{target_type}': {exc}")
+        raise RuntimeError(f"[Cycles] Failed to set compute device '{target_type}': {exc}")
 
     devices = prefs.get_devices()
     any_enabled = False
@@ -120,13 +114,12 @@ def _configure_cycles_device(scene: bpy.types.Scene) -> None:
     try:
         scene.cycles.device = 'GPU'
     except Exception as exc:
-        log_warn(f"[Cycles] Failed to set GPU device on scene: {exc}")
-        return
+        raise RuntimeError(f"[Cycles] Failed to set GPU device on scene: {exc}")
 
     if any_enabled:
         log_info(f"[Cycles] Using {target_type} devices for rendering.")
     else:
-        log_warn(f"[Cycles] No devices enabled for type '{target_type}'.")
+        raise RuntimeError(f"[Cycles] No devices enabled for type '{target_type}'.")
 
 
 def log_info(msg: str):
@@ -146,34 +139,14 @@ def _configure_best_denoiser(scene: bpy.types.Scene) -> None:
     try:
         cycles = scene.cycles
     except Exception:
-        return
+        raise RuntimeError("[Cycles] Scene has no Cycles settings; cannot configure denoiser.")
     try:
-        available = {item.identifier for item in cycles.bl_rna.properties["denoiser"].enum_items}
-    except Exception:
-        available = set()
-
-    device_hint = os.environ.get("SCDL_CYCLES_DEVICE", "").strip().upper()
-    preferred = []
-    if device_hint in {"GPU", "CUDA", "OPTIX"}:
-        preferred.append("OPTIX")
-    preferred.append("OPENIMAGEDENOISE")
-    preferred.extend(["AUTO", "DEFAULT"])
-
-    for cand in preferred:
-        if cand in available:
-            try:
-                cycles.denoiser = cand
-                log_info(f"[Cycles] Preview denoiser → {cand}")
-                return
-            except Exception:
-                continue
-    if available:
-        try:
-            fallback = next(iter(available))
-            cycles.denoiser = fallback
-            log_warn(f"[Cycles] Preview denoiser fallback → {fallback}")
-        except Exception:
-            pass
+        cycles.denoiser = "OPTIX"
+    except Exception as exc:
+        raise RuntimeError(f"[Cycles] Failed to set OptiX denoiser: {exc}")
+    if getattr(cycles, "denoiser", None) != "OPTIX":
+        raise RuntimeError("[Cycles] OptiX denoiser not active after assignment.")
+    log_info("[Cycles] Preview denoiser → OPTIX")
 
 # =====================
 # Step 1: Preview render
@@ -222,49 +195,52 @@ def render_preview():
             try:
                 scene.cycles.adaptive_threshold = max(0.0, float(PREVIEW_ADAPTIVE_THRESHOLD))
                 log_info(f"[Cycles] Preview adaptive threshold → {scene.cycles.adaptive_threshold:.4f}")
-            except Exception:
-                pass
+            except Exception as exc:
+                raise RuntimeError(f"[Cycles] Failed to set preview adaptive threshold: {exc}")
         if PREVIEW_ADAPTIVE_MIN:
             try:
                 scene.cycles.adaptive_min_samples = max(1, min(PREVIEW_SPP, int(float(PREVIEW_ADAPTIVE_MIN))))
                 log_info(f"[Cycles] Preview adaptive min samples → {scene.cycles.adaptive_min_samples}")
-            except Exception:
-                pass
+            except Exception as exc:
+                raise RuntimeError(f"[Cycles] Failed to set preview adaptive minimum samples: {exc}")
         # Preview noise controls tuned for saliency stability
         # Optional: disable caustics (reduces fireflies without harming edges)
-        try:
-            if int(os.environ.get("SCDL_PREVIEW_CAUSTICS", "0")) == 0:
+        if int(os.environ.get("SCDL_PREVIEW_CAUSTICS", "0")) == 0:
+            try:
                 scene.cycles.caustics_reflective = False
                 scene.cycles.caustics_refractive = False
-        except Exception:
-            pass
+            except Exception as exc:
+                raise RuntimeError(f"[Cycles] Failed to disable preview caustics: {exc}")
         # Optional: mild filter glossy to calm specular noise
-        try:
-            bg = os.environ.get("SCDL_PREVIEW_BLUR_GLOSSY", "").strip()
-            if bg:
+        bg = os.environ.get("SCDL_PREVIEW_BLUR_GLOSSY", "").strip()
+        if bg:
+            try:
                 scene.cycles.blur_glossy = float(bg)
-        except Exception:
-            pass
+            except Exception as exc:
+                raise RuntimeError(f"[Cycles] Failed to set preview blur glossy value: {exc}")
         # Optional: light clamping (set only if provided)
-        try:
-            cd = os.environ.get("SCDL_PREVIEW_CLAMP_DIRECT", "").strip()
-            ci = os.environ.get("SCDL_PREVIEW_CLAMP_INDIRECT", "").strip()
-            if cd:
+        cd = os.environ.get("SCDL_PREVIEW_CLAMP_DIRECT", "").strip()
+        ci = os.environ.get("SCDL_PREVIEW_CLAMP_INDIRECT", "").strip()
+        if cd:
+            try:
                 scene.cycles.sample_clamp_direct = max(0.0, float(cd))
-            if ci:
+            except Exception as exc:
+                raise RuntimeError(f"[Cycles] Failed to set preview direct clamp: {exc}")
+        if ci:
+            try:
                 scene.cycles.sample_clamp_indirect = max(0.0, float(ci))
-        except Exception:
-            pass
+            except Exception as exc:
+                raise RuntimeError(f"[Cycles] Failed to set preview indirect clamp: {exc}")
         if PREVIEW_DENOISE:
             try:
                 scene.cycles.use_denoising = True
-            except Exception:
-                pass
+            except Exception as exc:
+                raise RuntimeError(f"[Cycles] Failed to enable preview denoising: {exc}")
             for vl in scene.view_layers:
                 try:
                     vl.cycles.use_denoising = True
-                except Exception:
-                    pass
+                except Exception as exc:
+                    raise RuntimeError(f"[Cycles] Failed to enable preview denoising on view layer '{vl.name}': {exc}")
             _configure_best_denoiser(scene)
     except Exception as exc:
         log_error(f"Failed to configure Cycles preview settings: {exc}")
@@ -283,8 +259,7 @@ def main():
     if step in ('preview', 'step1', '1'):
         render_preview()
     else:
-        log_warn(f"[WARN] Unknown SCDL_BLEND_STEP={step}; this helper only supports 'preview'.")
-        render_preview()
+        raise RuntimeError(f"Unsupported SCDL_BLEND_STEP={step}; this helper only supports 'preview'.")
 
 
 if __name__ == "__main__":
