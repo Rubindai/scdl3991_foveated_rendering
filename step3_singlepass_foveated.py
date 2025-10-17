@@ -74,15 +74,43 @@ def _env_float(key: str, default: float) -> float:
         return float(default)
 
 
+def _env_float_optional(key: str) -> float | None:
+    raw = _get_env_value(key, _ENV_SENTINEL)
+    if raw == _ENV_SENTINEL:
+        return None
+    raw = raw.strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except Exception:
+        log_warn(f"Invalid float for {key}='{raw}', ignoring override.")
+        return None
+
+
 ADAPTIVE_THRESHOLD = float(_get_env_fallback("SCDL_ADAPTIVE_THRESHOLD", "SCDL_ROI_CYCLES_THRESHOLD", "0.03"))
 BASE_SAMPLES = int(_get_env_fallback("SCDL_FOVEATED_BASE_SPP", "SCDL_BASE_CYCLES_SPP", "256"))
 PEAK_SAMPLES = int(_get_env_fallback("SCDL_FOVEATED_MAX_SPP", "SCDL_ROI_CYCLES_SPP", str(max(BASE_SAMPLES, 512))))
 MIN_SAMPLES = int(_get_env_fallback("SCDL_FOVEATED_MIN_SPP", "SCDL_ROI_ADAPTIVE_MIN_SAMPLES", "32"))
 CYCLES_DEVICE = _get_env_value("SCDL_CYCLES_DEVICE", "CPU")
 AUTOSPP_ENABLED = int(_get_env_value("SCDL_FOVEATED_AUTOSPP", "1")) != 0
+GUIDING_ENABLED = int(_get_env_value("SCDL_FOVEATED_GUIDING", "1")) != 0
+GUIDING_TRAINING = max(1, int(_get_env_value("SCDL_FOVEATED_GUIDING_TRAINING", "64")))
+GUIDING_DIRECTION = _get_env_value("SCDL_FOVEATED_GUIDING_MODE", "PATH_GUIDING").strip().upper()
+FILTER_GLOSSY_VALUE = _env_float("SCDL_FOVEATED_FILTER_GLOSSY", 0.5)
+SCRAMBLE_DISTANCE = _env_float_optional("SCDL_FOVEATED_SCRAMBLE_DISTANCE")
+CLAMP_DIRECT = _env_float_optional("SCDL_FOVEATED_CLAMP_DIRECT")
+CLAMP_INDIRECT = _env_float_optional("SCDL_FOVEATED_CLAMP_INDIRECT")
+CAUSTICS_ENABLED = int(_get_env_value("SCDL_FOVEATED_CAUSTICS", "0")) != 0
 
 # --- Constants ---
 FOVEATION_GROUP_NAME = "FoveationMixer"
+EMISSION_NODE_TYPES = tuple(
+    t for t in (
+        getattr(bpy.types, "ShaderNodeEmission", None),
+        getattr(bpy.types, "ShaderNodeBackground", None),
+    ) if t is not None
+)
 
 def log_info(msg: str): LOGGER.info(msg)
 def log_warn(msg: str): LOGGER.warning(msg)
@@ -244,6 +272,56 @@ def main():
     cycles.use_denoising = True
     _configure_best_denoiser(cycles, CYCLES_DEVICE)
 
+    try:
+        cycles.blur_glossy = FILTER_GLOSSY_VALUE
+    except Exception:
+        pass
+
+    if not CAUSTICS_ENABLED:
+        try:
+            cycles.caustics_reflective = False
+            cycles.caustics_refractive = False
+        except Exception:
+            pass
+
+    if CLAMP_DIRECT is not None:
+        try:
+            cycles.sample_clamp_direct = max(0.0, CLAMP_DIRECT)
+            log_info(f"Clamped direct light samples → {cycles.sample_clamp_direct}")
+        except Exception as exc:
+            log_warn(f"Could not set direct clamp: {exc}")
+    if CLAMP_INDIRECT is not None:
+        try:
+            cycles.sample_clamp_indirect = max(0.0, CLAMP_INDIRECT)
+            log_info(f"Clamped indirect light samples → {cycles.sample_clamp_indirect}")
+        except Exception as exc:
+            log_warn(f"Could not set indirect clamp: {exc}")
+
+    if SCRAMBLE_DISTANCE is not None:
+        try:
+            cycles.scrambling_distance = max(0.0, SCRAMBLE_DISTANCE)
+            log_info(f"Scrambling distance → {cycles.scrambling_distance}")
+        except Exception as exc:
+            log_warn(f"Could not set scrambling distance: {exc}")
+
+    if GUIDING_ENABLED:
+        try:
+            cycles.use_guiding = True
+            if hasattr(cycles, "guiding_training_samples"):
+                cycles.guiding_training_samples = GUIDING_TRAINING
+            if hasattr(cycles, "guiding_distribution"):
+                valid_modes = {item.identifier for item in cycles.bl_rna.properties["guiding_distribution"].enum_items}
+                target = GUIDING_DIRECTION if GUIDING_DIRECTION in valid_modes else "PATH_GUIDING"
+                cycles.guiding_distribution = target
+            log_info(f"Path guiding enabled (training samples={GUIDING_TRAINING}, mode={cycles.guiding_distribution})")
+        except Exception as exc:
+            log_warn(f"Could not enable path guiding: {exc}")
+    else:
+        try:
+            cycles.use_guiding = False
+        except Exception:
+            pass
+
     # Enable denoising on view layers and store guiding passes (albedo/normal)
     for vl in scene.view_layers:
         try:
@@ -315,6 +393,10 @@ def main():
         original_shader_link = output_node.inputs['Surface'].links[0]
         original_shader_node = original_shader_link.from_node
         original_shader_socket = original_shader_link.from_socket
+
+        if EMISSION_NODE_TYPES and isinstance(original_shader_node, EMISSION_NODE_TYPES):
+            log_info(f"Material '{mat.name}' emission/background shader detected; skipping simplification.")
+            continue
 
         # Skip if a FoveationMixer already feeds the output
         if isinstance(original_shader_node, bpy.types.ShaderNodeGroup) and \
