@@ -22,6 +22,8 @@ import os
 import sys
 from contextlib import nullcontext
 from pathlib import Path
+from typing import Sequence
+import time
 
 os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
 
@@ -88,6 +90,9 @@ def fail(msg: str, code: int = 1):
     sys.exit(code)
 
 USE_AMP = torch.cuda.is_available() and int(os.environ.get("SCDL_MASK_AMP", "1")) != 0
+ALLOW_TF32 = torch.cuda.is_available() and int(os.environ.get("SCDL_MASK_ALLOW_TF32", "1")) != 0
+DEVICE_OVERRIDE_RAW = os.environ.get("SCDL_MASK_DEVICE", "").strip()
+DEVICE_OVERRIDE = DEVICE_OVERRIDE_RAW if DEVICE_OVERRIDE_RAW else None
 
 
 # ---- Preprocess (no resize here; we letterbox manually) ----
@@ -100,14 +105,24 @@ def _make_preprocess():
 
 
 # ---- Load DINOv3 model via the repo's torch.hub entrypoint ----
-def load_dinov3_model(repo_dir: Path, hub_entry: str, weight_path: Path, device=None):
+def load_dinov3_model(repo_dir: Path, hub_entry: str, weight_path: Path, device=None, *, device_override: str | None = None):
     if not repo_dir.exists():
         fail(
             f"[DINO] Missing repo at {repo_dir}. Set SCDL_DINO_REPO to your local clone of facebookresearch/dinov3.")
     if not weight_path.exists():
         fail(f"[DINO] Missing weights: {weight_path}")
 
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    if device_override:
+        try:
+            device = torch.device(device_override)
+        except Exception as exc:
+            fail(f"[DINO] Invalid SCDL_MASK_DEVICE='{device_override}': {exc}")
+    else:
+        device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+
+    if device.type == "cuda" and not torch.cuda.is_available():
+        fail("[DINO] CUDA device requested but torch.cuda.is_available() is False.")
+
     preprocess = _make_preprocess()
 
     try:
@@ -118,6 +133,21 @@ def load_dinov3_model(repo_dir: Path, hub_entry: str, weight_path: Path, device=
 
     # Quick structure sanity check for DINOv3 ViT models
     model.eval().to(device)
+
+    if ALLOW_TF32 and device.type == "cuda":
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.set_float32_matmul_precision("high")
+            log_info("[DINO] TF32 math enabled for faster inference.")
+        except Exception as exc:
+            log_warn(f"[DINO] Could not enable TF32 ({exc}).")
+
+    if device_override:
+        log_info(f"[DINO] Using explicit device override: {device}")
+    else:
+        log_info(f"[DINO] Using device: {device}")
+
     return model, preprocess, device
 
 
@@ -146,6 +176,89 @@ def _normalize01(t: torch.Tensor) -> torch.Tensor:
     lo = float(t.min())
     hi = float(t.max())
     return (t - lo) / (hi - lo + 1e-6) if hi > lo else torch.zeros_like(t)
+
+
+def _parse_scales(scales_str: str, *, lo: int = 160, hi: int = 896) -> list[int]:
+    values: list[int] = []
+    for token in scales_str.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            val = int(token)
+        except ValueError:
+            log_warn(f"[DINO] Ignoring non-integer scale '{token}'.")
+            continue
+        if val < lo or val > hi:
+            log_warn(f"[DINO] Ignoring out-of-range scale {val} (expected {lo}-{hi}).")
+            continue
+        values.append(val)
+    return values
+
+
+def _parse_scale_weights(weights_str: str, count: int) -> torch.Tensor | None:
+    tokens = [tok.strip() for tok in weights_str.split(",") if tok.strip()]
+    if not tokens:
+        return None
+    if len(tokens) != count:
+        log_warn(f"[DINO] Ignoring SCDL_MASK_SCALE_WEIGHTS (expected {count} values, got {len(tokens)}).")
+        return None
+    try:
+        weights = torch.tensor([float(tok) for tok in tokens], dtype=torch.float32)
+    except ValueError:
+        log_warn("[DINO] Could not parse SCDL_MASK_SCALE_WEIGHTS as floats; ignoring.")
+        return None
+    if torch.all(weights == 0):
+        log_warn("[DINO] Scale weights sum to zero; ignoring.")
+        return None
+    weights = torch.clamp(weights, min=0.0)
+    if torch.all(weights == 0):
+        log_warn("[DINO] Scale weights are non-positive; ignoring.")
+        return None
+    weights /= weights.sum()
+    return weights
+
+
+def _auto_scale_list(height: int, width: int) -> list[int]:
+    short = max(1, min(height, width))
+    if short <= 256:
+        ratios = [1.0]
+    elif short <= 384:
+        ratios = [0.75, 1.0]
+    elif short <= 512:
+        ratios = [0.75, 0.875, 1.0]
+    elif short <= 768:
+        ratios = [0.6, 0.8, 1.0]
+    else:
+        ratios = [0.5, 0.7, 1.0]
+    scales = {max(32, int(round(short * r))) for r in ratios}
+    return sorted(scales)
+
+
+def _combine_scale_maps(maps: Sequence[torch.Tensor], mode: str, weights: torch.Tensor | None) -> torch.Tensor:
+    if len(maps) == 1:
+        return maps[0]
+    stack = torch.stack(list(maps), dim=0)
+    mode = mode.lower()
+    if mode == "max":
+        return stack.max(dim=0).values
+    if mode == "median":
+        return stack.median(dim=0).values
+    if mode == "weighted" and weights is not None:
+        w = weights.to(stack.device).view(-1, 1, 1)
+        return torch.sum(stack * w, dim=0)
+    if mode not in {"mean", "weighted"}:
+        log_warn(f"[DINO] Unknown SCDL_MASK_REDUCE='{mode}', defaulting to mean.")
+    return stack.mean(dim=0)
+
+
+def _auto_grabcut_iters(height: int, width: int) -> int:
+    short = max(1, min(height, width))
+    if short <= 512:
+        return 6
+    if short <= 960:
+        return 8
+    return 10
 
 
 # ===== Your core token helpers (ported from script.py) =====
@@ -235,7 +348,8 @@ def _user_saliency_single_scale(img_np_hw3: np.ndarray, model, preprocess, devic
     x = preprocess(img_let).unsqueeze(0).to(device)  # [1,3,size,size]
     amp_ctx = nullcontext()
     if _use_amp_for_device(device, use_amp):
-        amp_ctx = torch.cuda.amp.autocast(dtype=torch.float16)
+        device_type = str(device).split(":", 1)[0]
+        amp_ctx = torch.autocast(device_type=device_type, dtype=torch.float16)
     with amp_ctx:
         patch_tokens, cls_token, H_p, W_p, _ = get_patch_tokens_and_cls(
             model, x, patch_size=PATCH_SIZE)
@@ -270,18 +384,29 @@ def dense_feature_importance_mask(img_np_hw3: np.ndarray, model, preprocess, dev
     core = os.environ.get("SCDL_MASK_CORE", "user").strip().lower()
     amp_enabled = _use_amp_for_device(device, USE_AMP)
 
+    reduce_mode = os.environ.get("SCDL_MASK_REDUCE", "mean").strip().lower()
+    height, width = img_np_hw3.shape[:2]
+
     if core == "builtin":
-        # Previous implementation: fuse multiple sizes via intermediate layers
         scales_str = os.environ.get("SCDL_MASK_SCALES", "336").strip()
-        sizes = [int(s) for s in scales_str.split(",") if s.strip().isdigit()]
-        sizes = [s for s in sizes if 160 <= s <= 448] or [336]
+        if scales_str.lower() == "auto":
+            sizes = _auto_scale_list(height, width)
+            sizes = [min(448, max(160, s)) for s in sizes]
+        else:
+            sizes = _parse_scales(scales_str, hi=448) or [336]
+        weight_tensor: torch.Tensor | None = None
+        if reduce_mode == "weighted":
+            raw_weights = os.environ.get("SCDL_MASK_SCALE_WEIGHTS", "")
+            weight_tensor = _parse_scale_weights(raw_weights, len(sizes))
+            if weight_tensor is None:
+                reduce_mode = "mean"
         maps = []
         for sz in sizes:
             maps.append(_user_saliency_single_scale(
                 img_np_hw3, model, preprocess, device, out_wh, size=sz, use_amp=amp_enabled))
-        sal = maps[0] if len(maps) == 1 else torch.stack(
-            maps, dim=0).mean(dim=0)
+        sal = _combine_scale_maps(maps, reduce_mode, weight_tensor)
         sal = _normalize01(sal)
+        log_info(f"[DINO] Saliency core (builtin) scales={sizes}")
         return sal.detach().cpu().numpy().astype(np.float32)
 
     # USER path (default)
@@ -289,14 +414,24 @@ def dense_feature_importance_mask(img_np_hw3: np.ndarray, model, preprocess, dev
     # you can use multiple scales by setting the environment variable, e.g.:
     # SCDL_MASK_SCALES="336,392,448"
     scales_str = os.environ.get("SCDL_MASK_SCALES", "448").strip()
-    sizes = [int(s) for s in scales_str.split(",") if s.strip().isdigit()]
-    sizes = [s for s in sizes if 160 <= s <= 448] or [336]
+    if scales_str.lower() == "auto":
+        sizes = _auto_scale_list(height, width)
+        sizes = [min(768, max(160, s)) for s in sizes]
+    else:
+        sizes = _parse_scales(scales_str, hi=768) or [448]
+    weight_tensor: torch.Tensor | None = None
+    if reduce_mode == "weighted":
+        raw_weights = os.environ.get("SCDL_MASK_SCALE_WEIGHTS", "")
+        weight_tensor = _parse_scale_weights(raw_weights, len(sizes))
+        if weight_tensor is None:
+            reduce_mode = "mean"
     maps = []
     for sz in sizes:
         maps.append(_user_saliency_single_scale(
             img_np_hw3, model, preprocess, device, out_wh, size=sz, use_amp=amp_enabled))
-    sal = maps[0] if len(maps) == 1 else torch.stack(maps, dim=0).mean(dim=0)
+    sal = _combine_scale_maps(maps, reduce_mode, weight_tensor)
     sal = _normalize01(sal)
+    log_info(f"[DINO] Saliency core scales={sizes}")
     return sal.detach().cpu().numpy().astype(np.float32)
 
 
@@ -334,9 +469,16 @@ def refine_with_grabcut(img_rgb: np.ndarray, prob: np.ndarray, iters: int | None
     bgdModel = np.zeros((1, 65), np.float64)
     fgdModel = np.zeros((1, 65), np.float64)
 
-    iters_env = os.environ.get("SCDL_MASK_GRABCUT_ITERS")
-    iters = int(iters_env) if (
-        iters_env and iters_env.isdigit()) else (iters or 5)
+    iters_env = os.environ.get("SCDL_MASK_GRABCUT_ITERS", "").strip().lower()
+    if iters_env == "auto":
+        iters = _auto_grabcut_iters(H, W)
+    elif iters_env.isdigit():
+        iters = int(iters_env)
+    elif iters is None:
+        iters = _auto_grabcut_iters(H, W)
+
+    iters = max(1, int(iters))
+    log_info(f"[DINO] GrabCut iterations → {iters}")
 
     cv2.grabCut(img_rgb, mask, None, bgdModel,
                 fgdModel, iters, cv2.GC_INIT_WITH_MASK)
@@ -439,22 +581,29 @@ def main():
         img = img[:, :, :3]
     H, W = img.shape[:2]
 
-    model, preprocess, device = load_dinov3_model(REPO_DIR, DINO_HUB_ENTRY, WEIGHT_PATH)
+    model, preprocess, device = load_dinov3_model(
+        REPO_DIR, DINO_HUB_ENTRY, WEIGHT_PATH, device_override=DEVICE_OVERRIDE)
     log_info(f"[DINO] Using architecture '{DINO_ARCH}' (hub entry '{DINO_HUB_ENTRY}').")
     if _use_amp_for_device(device, USE_AMP):
-        log_info("[DINO] Mixed precision enabled (torch.cuda.amp autocast).")
+        log_info("[DINO] Mixed precision enabled (torch.autocast).")
     else:
         reason = "device is not CUDA" if not str(device).startswith("cuda") else "SCDL_MASK_AMP=0"
         log_info(f"[DINO] Mixed precision disabled ({reason}).")
 
     # ------- Build saliency mask (now via USER attention by default) -------
+    t_sal = time.perf_counter()
     mask = dense_feature_importance_mask(
         img, model, preprocess, device, (W, H))
+    log_info(f"[DINO] Saliency core time: {time.perf_counter() - t_sal:.2f}s")
 
     # Refinements (edge-aware + watershed)
+    t_ref_gc = time.perf_counter()
     mask = refine_with_grabcut(
         img[:, :, :3].astype(np.uint8), mask, iters=None)
+    log_info(f"[DINO] GrabCut refinement time: {time.perf_counter() - t_ref_gc:.2f}s")
+    t_ref_ws = time.perf_counter()
     mask = refine_with_watershed(img[:, :, :3].astype(np.uint8), mask)
+    log_info(f"[DINO] Watershed refinement time: {time.perf_counter() - t_ref_ws:.2f}s")
 
     # --- Save the raw mask and its visualization for sanity checks FIRST ---
     np.save(MASK_NPY, mask)

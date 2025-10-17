@@ -65,6 +65,15 @@ def _get_env_fallback(primary: str, legacy: str, default: str) -> str:
     return _get_env_value(legacy, default)
 
 
+def _env_float(key: str, default: float) -> float:
+    raw = _get_env_value(key, str(default))
+    try:
+        return float(raw)
+    except Exception:
+        log_warn(f"Invalid float for {key}='{raw}', using {default}")
+        return float(default)
+
+
 ADAPTIVE_THRESHOLD = float(_get_env_fallback("SCDL_ADAPTIVE_THRESHOLD", "SCDL_ROI_CYCLES_THRESHOLD", "0.03"))
 BASE_SAMPLES = int(_get_env_fallback("SCDL_FOVEATED_BASE_SPP", "SCDL_BASE_CYCLES_SPP", "256"))
 PEAK_SAMPLES = int(_get_env_fallback("SCDL_FOVEATED_MAX_SPP", "SCDL_ROI_CYCLES_SPP", str(max(BASE_SAMPLES, 512))))
@@ -409,33 +418,9 @@ def main():
             n_rl = nt.nodes.new('CompositorNodeRLayers')
             n_rl.location = Vector((-600, 200))
 
-            n_blur = nt.nodes.new('CompositorNodeBlur')
-            n_blur.location = Vector((-200, 200))
-            try:
-                n_blur.filter_type = 'GAUSS'
-            except Exception:
-                pass
-            n_blur.use_relative = False
-            blur_px = int(float(os.environ.get("SCDL_DEFOCUS_MAXBLUR", "32")))
-            blur_px = max(0, blur_px)
-            n_blur.size_x = blur_px
-            n_blur.size_y = blur_px
-
             n_mask = nt.nodes.new('CompositorNodeImage')
             n_mask.location = Vector((-650, -80))
             n_mask.image = mask_image
-
-            # Ensure factor is a single channel
-            n_bw = None
-            try:
-                n_bw = nt.nodes.new('CompositorNodeRGBToBW')
-            except Exception:
-                try:
-                    n_bw = nt.nodes.new('CompositorNodeSeparateColor')
-                except Exception:
-                    n_bw = None
-            if n_bw is not None:
-                n_bw.location = Vector((-450, -80))
 
             n_scale = nt.nodes.new('CompositorNodeScale')
             n_scale.location = Vector((-250, -80))
@@ -453,30 +438,103 @@ def main():
             n_scale.inputs['X'].default_value = sx
             n_scale.inputs['Y'].default_value = sy
 
-            n_mix = nt.nodes.new('CompositorNodeMixRGB')
-            n_mix.location = Vector((0, 100))
-            n_mix.blend_type = 'MIX'
-
-            n_comp = nt.nodes.new('CompositorNodeComposite')
-            n_comp.location = Vector((200, 100))
-
-            # Links: output = mask*sharp + (1-mask)*blur
-            nt.links.new(n_rl.outputs['Image'], n_blur.inputs['Image'])
-            nt.links.new(n_blur.outputs['Image'], n_mix.inputs[1])  # A = blur
-            nt.links.new(n_rl.outputs['Image'], n_mix.inputs[2])    # B = sharp
+            # Ensure factor is a single channel
+            n_bw = None
+            try:
+                n_bw = nt.nodes.new('CompositorNodeRGBToBW')
+            except Exception:
+                try:
+                    n_bw = nt.nodes.new('CompositorNodeSeparateColor')
+                except Exception:
+                    n_bw = None
             if n_bw is not None:
-                # Route through grayscale
+                n_bw.location = Vector((-450, -80))
+
+            if n_bw is not None:
                 in_name = 'Image' if 'Image' in [s.name for s in n_bw.inputs] else list(n_bw.inputs)[0].name
                 nt.links.new(n_mask.outputs['Image'], n_bw.inputs[in_name])
                 out_name = 'Val'
                 names = [s.name for s in n_bw.outputs]
                 if out_name not in names and names:
                     out_name = names[0]
-                nt.links.new(n_bw.outputs[out_name], n_scale.inputs['Image'])
+                mask_socket = n_bw.outputs[out_name]
             else:
-                # Fallback: feed color directly; Blender will implicitly convert to value
-                nt.links.new(n_mask.outputs['Image'], n_scale.inputs['Image'])
-            nt.links.new(n_scale.outputs['Image'], n_mix.inputs[0]) # Fac = mask (scalar)
+                mask_socket = n_mask.outputs['Image']
+            nt.links.new(mask_socket, n_scale.inputs['Image'])
+
+            blur_node = None
+            blur_output = None
+
+            if focus_mode == "defocus":
+                max_blur_px = max(0.0, _env_float("SCDL_DEFOCUS_MAXBLUR", 32.0))
+                fstop = max(0.1, _env_float("SCDL_DEFOCUS_FSTOP", 4.0))
+                zscale = max(0.01, _env_float("SCDL_DEFOCUS_ZSCALE", 1.0))
+                periphery_strength = max_blur_px / max(fstop, 1e-3)
+                try:
+                    n_invert = nt.nodes.new('CompositorNodeMath')
+                    n_invert.operation = 'SUBTRACT'
+                    n_invert.use_clamp = True
+                    n_invert.inputs[0].default_value = 1.0
+                    n_invert.location = Vector((-120, -200))
+                    nt.links.new(n_scale.outputs['Image'], n_invert.inputs[1])
+
+                    n_pow = nt.nodes.new('CompositorNodeMath')
+                    n_pow.operation = 'POWER'
+                    n_pow.use_clamp = True
+                    n_pow.inputs[1].default_value = zscale
+                    n_pow.location = Vector((80, -200))
+                    nt.links.new(n_invert.outputs[0], n_pow.inputs[0])
+
+                    n_mult = nt.nodes.new('CompositorNodeMath')
+                    n_mult.operation = 'MULTIPLY'
+                    n_mult.use_clamp = True
+                    n_mult.inputs[1].default_value = periphery_strength
+                    n_mult.location = Vector((260, -200))
+                    nt.links.new(n_pow.outputs[0], n_mult.inputs[0])
+
+                    blur_node = nt.nodes.new('CompositorNodeBokehBlur')
+                    blur_node.location = Vector((-200, 200))
+                    blur_node.use_variable_size = True
+                    try:
+                        blur_node.max_blur = max_blur_px
+                    except Exception:
+                        pass
+                    nt.links.new(n_rl.outputs['Image'], blur_node.inputs['Image'])
+                    nt.links.new(n_mult.outputs[0], blur_node.inputs['Size'])
+                    blur_output = blur_node.outputs['Image']
+                    log_info(f"Compositor defocus enabled (fstop={fstop}, zscale={zscale}, max_blur={max_blur_px}).")
+                except Exception as exc:
+                    log_warn(f"Compositor Bokeh blur unavailable ({exc}); falling back to Gaussian blur.")
+                    blur_node = None
+                    blur_output = None
+
+            if blur_output is None:
+                blur_px = int(round(max(0.0, _env_float("SCDL_DEFOCUS_MAXBLUR", 32.0))))
+                blur_node = nt.nodes.new('CompositorNodeBlur')
+                blur_node.location = Vector((-200, 200))
+                try:
+                    blur_node.filter_type = 'GAUSS'
+                except Exception:
+                    pass
+                blur_node.use_relative = False
+                blur_node.size_x = blur_px
+                blur_node.size_y = blur_px
+                nt.links.new(n_rl.outputs['Image'], blur_node.inputs['Image'])
+                blur_output = blur_node.outputs['Image']
+                if focus_mode == "defocus":
+                    log_info(f"Compositor fallback blur enabled (gaussian, radius={blur_px}px).")
+                else:
+                    log_info(f"Compositor blur enabled (gaussian, radius={blur_px}px).")
+
+            n_mix = nt.nodes.new('CompositorNodeMixRGB')
+            n_mix.location = Vector((200, 100))
+            n_mix.blend_type = 'MIX'
+            nt.links.new(n_scale.outputs['Image'], n_mix.inputs[0])  # Factor = mask (fovea keeps sharp image)
+            nt.links.new(blur_output, n_mix.inputs[1])               # A = blurred
+            nt.links.new(n_rl.outputs['Image'], n_mix.inputs[2])     # B = sharp
+
+            n_comp = nt.nodes.new('CompositorNodeComposite')
+            n_comp.location = Vector((400, 100))
             nt.links.new(n_mix.outputs['Image'], n_comp.inputs['Image'])
 
             # Optional debug outputs of mask/blur/mix to out/ (disabled by default)
@@ -496,13 +554,14 @@ def main():
                     s_blur.path = 'debug_blur'
                     s_mix.path  = 'debug_mix'
                     nt.links.new(n_scale.outputs['Image'], s_mask)
-                    nt.links.new(n_blur.outputs['Image'],  s_blur)
+                    nt.links.new(blur_output,              s_blur)
                     nt.links.new(n_mix.outputs['Image'],   s_mix)
                     log_info("Compositor debug outputs enabled (mask/blur/mix).")
                 except Exception as exc:
                     log_warn(f"Could not enable compositor debug outputs: {exc}")
 
-            log_info("Compositor set: periphery blur enabled (defocus mode).")
+            if focus_mode == "blur":
+                log_info("Compositor set: periphery blur enabled (gaussian mode).")
         except Exception as exc:
             log_warn(f"Could not set compositor defocus: {exc}")
     elif focus_mode == "dof":

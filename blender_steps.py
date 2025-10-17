@@ -141,6 +141,40 @@ def log_error(msg: str):
     LOGGER.error(msg)
 
 
+# Choose the fastest denoiser available (OPTIX on NVIDIA, OIDN otherwise)
+def _configure_best_denoiser(scene: bpy.types.Scene) -> None:
+    try:
+        cycles = scene.cycles
+    except Exception:
+        return
+    try:
+        available = {item.identifier for item in cycles.bl_rna.properties["denoiser"].enum_items}
+    except Exception:
+        available = set()
+
+    device_hint = os.environ.get("SCDL_CYCLES_DEVICE", "").strip().upper()
+    preferred = []
+    if device_hint in {"GPU", "CUDA", "OPTIX"}:
+        preferred.append("OPTIX")
+    preferred.append("OPENIMAGEDENOISE")
+    preferred.extend(["AUTO", "DEFAULT"])
+
+    for cand in preferred:
+        if cand in available:
+            try:
+                cycles.denoiser = cand
+                log_info(f"[Cycles] Preview denoiser → {cand}")
+                return
+            except Exception:
+                continue
+    if available:
+        try:
+            fallback = next(iter(available))
+            cycles.denoiser = fallback
+            log_warn(f"[Cycles] Preview denoiser fallback → {fallback}")
+        except Exception:
+            pass
+
 # =====================
 # Step 1: Preview render
 # =====================
@@ -152,6 +186,8 @@ def render_preview():
     PREVIEW_SPP = int(os.environ.get("SCDL_PREVIEW_SPP", "16"))
     PREVIEW_DENOISE = int(os.environ.get("SCDL_PREVIEW_DENOISE", "1")) != 0
     PREVIEW_PATH = (OUT_DIR / "preview.png")
+    PREVIEW_ADAPTIVE_THRESHOLD = os.environ.get("SCDL_PREVIEW_ADAPTIVE_THRESHOLD", "").strip()
+    PREVIEW_ADAPTIVE_MIN = os.environ.get("SCDL_PREVIEW_MIN_SPP", "").strip()
 
     # Keep preview aspect ratio equal to final render to avoid ROI mapping issues
     rw, rh = int(scene.render.resolution_x), int(scene.render.resolution_y)
@@ -182,12 +218,54 @@ def render_preview():
     try:
         scene.cycles.samples = PREVIEW_SPP
         scene.cycles.use_adaptive_sampling = True
+        if PREVIEW_ADAPTIVE_THRESHOLD:
+            try:
+                scene.cycles.adaptive_threshold = max(0.0, float(PREVIEW_ADAPTIVE_THRESHOLD))
+                log_info(f"[Cycles] Preview adaptive threshold → {scene.cycles.adaptive_threshold:.4f}")
+            except Exception:
+                pass
+        if PREVIEW_ADAPTIVE_MIN:
+            try:
+                scene.cycles.adaptive_min_samples = max(1, min(PREVIEW_SPP, int(float(PREVIEW_ADAPTIVE_MIN))))
+                log_info(f"[Cycles] Preview adaptive min samples → {scene.cycles.adaptive_min_samples}")
+            except Exception:
+                pass
+        # Preview noise controls tuned for saliency stability
+        # Optional: disable caustics (reduces fireflies without harming edges)
+        try:
+            if int(os.environ.get("SCDL_PREVIEW_CAUSTICS", "0")) == 0:
+                scene.cycles.caustics_reflective = False
+                scene.cycles.caustics_refractive = False
+        except Exception:
+            pass
+        # Optional: mild filter glossy to calm specular noise
+        try:
+            bg = os.environ.get("SCDL_PREVIEW_BLUR_GLOSSY", "").strip()
+            if bg:
+                scene.cycles.blur_glossy = float(bg)
+        except Exception:
+            pass
+        # Optional: light clamping (set only if provided)
+        try:
+            cd = os.environ.get("SCDL_PREVIEW_CLAMP_DIRECT", "").strip()
+            ci = os.environ.get("SCDL_PREVIEW_CLAMP_INDIRECT", "").strip()
+            if cd:
+                scene.cycles.sample_clamp_direct = max(0.0, float(cd))
+            if ci:
+                scene.cycles.sample_clamp_indirect = max(0.0, float(ci))
+        except Exception:
+            pass
         if PREVIEW_DENOISE:
+            try:
+                scene.cycles.use_denoising = True
+            except Exception:
+                pass
             for vl in scene.view_layers:
                 try:
                     vl.cycles.use_denoising = True
                 except Exception:
                     pass
+            _configure_best_denoiser(scene)
     except Exception as exc:
         log_error(f"Failed to configure Cycles preview settings: {exc}")
         raise
