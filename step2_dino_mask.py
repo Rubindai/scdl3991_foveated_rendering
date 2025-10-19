@@ -16,7 +16,7 @@
 #   SCDL_DINO_LOCAL_DIR    # default models/dinov3-vitl16  (local HF folder; offline)
 #   SCDL_PREVIEW_PATH      # default out/preview.png
 #   SCDL_OUT_DIR           # default out
-#   SCDL_DINO_SIZE         # default 224 (try 336/384 for crisper, still one pass)
+#   SCDL_DINO_SIZE         # default 336 (try 336/384 for crisper, still one pass)
 #   SCDL_PERC_LO/H I       # default 0.60 / 0.995 (contrast stretch)
 #   SCDL_MASK_GAMMA        # default 0.70  (gamma <1 broadens highlights; >1 sharpens)
 #   SCDL_MORPH_K           # default 3     (small GPU clean-up)
@@ -163,7 +163,7 @@ def main():
     img_np = to_numpy_hwc_uint8(img_bchw)           # HWC uint8
 
     # (still single forward) optionally bump input size for crisper grid
-    resize = int(os.getenv("SCDL_DINO_SIZE", "224"))
+    resize = int(os.getenv("SCDL_DINO_SIZE", "336"))
     inputs = processor(images=img_np, return_tensors="pt", do_resize=True, size=resize)
     pixel_values = inputs["pixel_values"].to(device, dtype=dtype, non_blocking=True)
     pixel_values = pixel_values.contiguous(memory_format=torch.channels_last)
@@ -197,10 +197,18 @@ def main():
 
     # Contrast stretch + gamma to expand dynamic range (GPU)
     def contrast_stretch(x, lo=0.60, hi=0.995, eps=1e-6):
-        qlo = torch.quantile(x, lo)
-        qhi = torch.quantile(x, hi)
-        y = (x - qlo) / (qhi - qlo + eps)
-        return y.clamp(0, 1)
+        # Compute quantiles in FP32 on-GPU on a small downsample for speed,
+       # then stretch the full-res map.
+        xf  = x.float()
+        Hq, Wq = int(xf.shape[-2]), int(xf.shape[-1])
+        if min(Hq, Wq) >= 128:
+            xs = F.avg_pool2d(xf, kernel_size=4, stride=4)
+        else:
+            xs = xf
+        qlo = torch.quantile(xs, lo)
+        qhi = torch.quantile(xs, hi)
+        y   = (xf - qlo) / (qhi - qlo + eps)
+        return y.clamp(0, 1).to(x.dtype)
 
     lo = float(os.getenv("SCDL_PERC_LO", "0.60"))
     hi = float(os.getenv("SCDL_PERC_HI", "0.995"))
