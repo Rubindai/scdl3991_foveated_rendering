@@ -3,7 +3,7 @@
 #
 # Outputs (matches Step 3 expectations):
 #   out/user_importance.npy
-#   out/fovea_mask.exr
+#   out/user_importance_mask.exr
 # Optional:
 #   out/user_importance_preview.png
 #
@@ -126,7 +126,7 @@ def main():
     PREVIEW_PATH = Path(os.getenv("SCDL_PREVIEW_PATH", "out/preview.png"))
     OUT_DIR      = Path(os.getenv("SCDL_OUT_DIR", "out"))
     MASK_NPY     = OUT_DIR / "user_importance.npy"
-    MASK_EXR     = OUT_DIR / "fovea_mask.exr"
+    MASK_EXR     = OUT_DIR / "user_importance_mask.exr"
     PREVIEW_PNG  = OUT_DIR / "user_importance_preview.png"
 
     MAKE_PREVIEW = int(os.getenv("SCDL_USER_IMPORTANCE_PREVIEW", "1"))
