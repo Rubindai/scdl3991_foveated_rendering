@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shared logging helpers for the SCDL pipeline."""
+"""Logging helpers with optional color output and file mirroring."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Iterable, List, Mapping, Optional, Union
 
 PathLike = Union[str, os.PathLike]
 
@@ -19,7 +19,7 @@ def _ensure_parent(path: Path) -> None:
 
 
 class _StreamTee(io.TextIOBase):
-    """Minimal TextIO wrapper that mirrors writes to multiple streams."""
+    """Text stream wrapper that mirrors writes to multiple streams."""
 
     def __init__(self, streams: List[io.TextIOBase]):
         super().__init__()
@@ -56,12 +56,12 @@ class _StreamTee(io.TextIOBase):
         raise OSError("tee stream has no single file descriptor")
 
     def close(self) -> None:  # type: ignore[override]
-        # Avoid closing underlying streams automatically (they are managed elsewhere).
+        # Do not close underlying streams. They are owned by the caller.
         pass
 
 
 class _StdIORouter:
-    """Redirects stdout/stderr so plain prints honor the logging mode."""
+    """Redirects stdout/stderr so plain prints honour the logging mode."""
 
     def __init__(self) -> None:
         self._original_stdout = sys.__stdout__
@@ -72,8 +72,11 @@ class _StdIORouter:
         atexit.register(self.restore)
 
     def configure(self, log_path: Path, targets: set[str]) -> None:
-        # Reconfigure only if something actually changed.
-        if self._log_path == log_path and self._targets == targets and ("file" not in targets or (self._file and not self._file.closed)):
+        if (
+            self._log_path == log_path
+            and self._targets == targets
+            and ("file" not in targets or (self._file and not self._file.closed))
+        ):
             return
 
         self.restore(close_file=True)
@@ -86,8 +89,16 @@ class _StdIORouter:
             file_stream = open(log_path, "a", encoding="utf-8", buffering=1)
             self._file = file_stream
 
-        stdout_target = self._build_stream(file_stream, self._original_stdout if "stdout" in targets else None, self._original_stdout)
-        stderr_target = self._build_stream(file_stream, self._original_stderr if "stdout" in targets else None, self._original_stderr)
+        stdout_target = self._build_stream(
+            file_stream,
+            self._original_stdout if "stdout" in targets else None,
+            self._original_stdout,
+        )
+        stderr_target = self._build_stream(
+            file_stream,
+            self._original_stderr if "stdout" in targets else None,
+            self._original_stderr,
+        )
 
         sys.stdout = stdout_target
         sys.stderr = stderr_target
@@ -139,14 +150,13 @@ _LEVEL_COLORS = {
 }
 _TAG_COLORS = {
     "[OK]": "\033[32m",
-    "[DINO]": "\033[35m",
-    "[Cycles]": "\033[36m",
-    "[Engine]": "\033[36m",
+    "[env]": "\033[35m",
+    "[timer]": "\033[90m",
+    "[step]": "\033[34m",
+    "[device]": "\033[36m",
+    "[system]": "\033[36m",
     "[WARN]": "\033[33m",
     "[ERROR]": "\033[31m",
-    "[env]": "\033[35m",
-    "[CMD]": "\033[90m",
-    "[DONE]": "\033[32m",
 }
 
 
@@ -166,20 +176,19 @@ class _ConsoleFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:  # type: ignore[override]
         message = super().format(record)
-        # Prefix with level tag and color when appropriate
         level_tag = _LEVEL_NAMES.get(record.levelno, record.levelname)
         prefix_text = f"[{level_tag}]"
         prefix = prefix_text
+
         if message.startswith(prefix_text):
-            remainder = message[len(prefix_text):]
+            remainder = message[len(prefix_text) :]
             if not remainder or remainder[0].isspace():
                 message = remainder.lstrip()
+
         if self._use_color:
             color = _LEVEL_COLORS.get(record.levelno)
             if color:
                 prefix = f"{color}{prefix_text}{_ANSI_RESET}"
-
-        if self._use_color:
             message = self._colorize_tags(message)
 
         if "\n" in message:
@@ -197,26 +206,30 @@ class _ConsoleFormatter(logging.Formatter):
 
 
 def get_logger(name: str, default_path: PathLike) -> logging.Logger:
-    """Configure a logger that honors SCDL_LOG_MODE/SCDL_LOG_FILE."""
+    """Configure a logger that honours SCDL_LOG_MODE/SCDL_LOG_FILE."""
+
     mode = os.environ.get("SCDL_LOG_MODE", "both").strip().lower()
     log_file_override = os.environ.get("SCDL_LOG_FILE", "").strip()
 
     if mode not in {"stdout", "file", "both"}:
         mode = "both"
 
-    targets = {mode}
     if mode == "both":
         targets = {"stdout", "file"}
+    elif mode == "stdout":
+        targets = {"stdout"}
+    else:
+        targets = {"file"}
 
     default_path = Path(default_path)
     log_path = Path(log_file_override).expanduser() if log_file_override else default_path
 
     _STDIO_ROUTER.configure(log_path, targets)
+
     logger = logging.getLogger(name)
     logger.setLevel(logging.INFO)
     logger.propagate = False
 
-    # Clear existing handlers to avoid duplicate logs when Blender reuses the interpreter
     for handler in list(logger.handlers):
         logger.removeHandler(handler)
 
@@ -235,4 +248,18 @@ def get_logger(name: str, default_path: PathLike) -> logging.Logger:
     return logger
 
 
-__all__ = ["get_logger"]
+def log_environment(logger: logging.Logger, items: Mapping[str, object]) -> None:
+    """Emit `[env] key=value` lines for the supplied mapping."""
+
+    for key, value in items.items():
+        logger.info("[env] %s=%s", key, value)
+
+
+def log_devices(logger: logging.Logger, devices: Iterable[str]) -> None:
+    """Emit `[device] name` entries for detected devices."""
+
+    for dev in devices:
+        logger.info("[device] %s", dev)
+
+
+__all__ = ["get_logger", "log_environment", "log_devices"]

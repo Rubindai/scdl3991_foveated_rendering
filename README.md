@@ -1,64 +1,60 @@
-# Scene-Driven Composite Pipeline
+# Scene-Driven Foveated Rendering
 
 ## Overview
-This repository hosts a hybrid Windows/WSL rendering pipeline that produces a saliency-guided foveated render in a single pass. Blender (running on Windows) generates a fast preview, and WSL computes a DINO-based importance map from it. A final, efficient render pass in Blender then uses this mask to vary rendering quality across the image, focusing detail on important regions without needing to composite multiple images.
+- Preview, saliency analysis, and final render are split into three audited stages (`step1_preview_blender.py`, `step2_dino_mask.py`, `step3_singlepass_foveated.py`).
+- Blender 4.5.2 LTS and an NVIDIA RTX 3060 (OPTIX) are hard requirements; the code path aborts immediately if either prerequisite is missing.
+- Shared utilities live in the `scdl/` package: colourised logging, GPU-aware timing, system validation, and path helpers.
 
+## Hardware & Software Requirements
+- **Blender:** 4.5.2 LTS (Windows build invoked from WSL).
+- **GPU:** NVIDIA RTX 3060 with OPTIX support (no CUDA/CPU fallback).
+- **WSL environment:** Python 3.10 with CUDA 12.1 (provided via `environment.yml`).
+- Local copy of `dinov3` weights (HF-format directory) placed wherever `SCDL_DINO_LOCAL_DIR` points.
 
-## Installation
+## Environment Setup
+```bash
+conda env create --file environment.yml
+conda activate scdl-foveated
+```
 
-This project uses [Conda](https://docs.conda.io/en/latest/) to manage the Python environment for the analysis scripts (Step 2).
-
-1.  **Create the Conda Environment:**
-    From the project root directory, run the following command to create the environment from the provided file:
-    ```bash
-    conda env create --file environment.yml
-    ```
-
-2.  **Activate the Environment:**
-    Before running the main pipeline script, you must activate the Conda environment:
-    ```bash
-    conda activate scdl-foveated
-    ```
-
-This will install all the necessary Python dependencies (PyTorch, OpenCV, OpenEXR, etc.).
-
-Already have the environment set up? Keep it synchronized with the repo by running:
+Keep the environment up to date with:
 
 ```bash
 conda env update --file environment.yml --prune
 ```
 
-## Prerequisites
-- Windows Blender installation accessible from WSL.
-- A local clone of the DINOv3 repository and its pre-trained weights.
-- Conda installed on your system.
-
-## Configuration
-1. Review and edit `.scdl.env` to match your environment paths, especially `BLENDER_EXE`.
-2. Place your working `.blend` files in `blender_files/` or override the `BLEND_FILE` environment variable.
-3. Ensure the `dinov3` repository and weights paths in `.scdl.env` are correct.
+The `.scdl.env` file stores runtime configuration (paths, sampling budgets, logging options) and is sourced automatically by the launcher script.
 
 ## Running the Pipeline
 ```bash
-# Preview → DINO mask → Single-pass foveated render
-./run_windows_blender_wsl.sh
+./run_windows_blender_wsl.sh                # uses BLEND_FILE from .scdl.env
+./run_windows_blender_wsl.sh path/to.scene.blend
 ```
-- Pass a different blend file with `./run_windows_blender_wsl.sh blender_files/your_scene.blend`.
-- Each stage logs to stdout and/or `out/scdl_pipeline.log` depending on `SCDL_LOG_MODE` / `SCDL_LOG_FILE`.
-- Persistent defaults live in `.scdl.env`; adjust logging, device selection, and render quality there.
 
-## Logging
-All Python stages (Blender preview/final and DINO mask) honor:
-- `SCDL_LOG_MODE`: `stdout`, `file`, or `both` (default).
-- `SCDL_LOG_FILE`: override log path; defaults to `out/scdl_pipeline.log` in the project root.
+Each stage:
+1. Validates platform requirements (Blender version, OPTIX devices, CUDA capability, Flash Attention).
+2. Emits colour-coded logs to stderr and `out/scdl_pipeline.log` (configurable via `SCDL_LOG_MODE` / `SCDL_LOG_FILE`).
+3. Records per-stage timings using GPU-synchronised `scdl.StageTimer` so inference and rendering durations are accurate.
 
-## Directory Layout
-- `blender_files/` – source .blend projects.
-- `out/` – preview/final renders, masks, logs.
-- `pipeline.md` – detailed description of each pipeline stage.
+Outputs land in `out/` (`preview.png`, `user_importance.{npy,exr}`, optional `user_importance_preview.png`, `final.png`, `scdl_pipeline.log`).
 
-## Troubleshooting
-- Missing preview? Re-run the preview stage or check Blender logs in `out/scdl_pipeline.log`.
-- DINO import errors? Verify `dinov3` path/weights in `.scdl.env` and Python dependencies in WSL.
+## Key Configuration Knobs
+- **Preview (Step 1)** — `SCDL_PREVIEW_SHORT`, `SCDL_PREVIEW_SPP`, `SCDL_PREVIEW_ADAPTIVE_THRESHOLD`, `SCDL_PREVIEW_DENOISE`.
+- **DINO Saliency (Step 2)** — `SCDL_DINO_LOCAL_DIR`, `SCDL_DINO_SIZE`, `SCDL_PERC_LO/HI`, `SCDL_MASK_GAMMA`, `SCDL_MORPH_K`, optional `SCDL_MASK_DEVICE` (must remain CUDA).
+- **Final Render (Step 3)** — `SCDL_FOVEATED_BASE_SPP/MIN_SPP/MAX_SPP`, `SCDL_ADAPTIVE_THRESHOLD`, `SCDL_ADAPTIVE_MIN_SAMPLES`, `SCDL_FOVEATED_FILTER_GLOSSY`.
 
-For stage-by-stage explanations and tunable parameters, refer to `pipeline.md` and inline comments within the scripts.
+All scripts reject non-OPTIX paths (`SCDL_CYCLES_DEVICE` must be `OPTIX`) and any CPU/CUDA fallbacks.
+
+## Logging & Timing
+- Colour palette highlights `[env]`, `[device]`, `[timer]`, and `[step]` tags for quick scanning.
+- Timing records include stage-by-stage runtime plus consolidated summaries at the end of Steps 2 and 3.
+- Setting `SCDL_LOG_MODE=file` disables console output and writes exclusively to the configured log file.
+
+## Verification Workflow
+- Minimal quick check: `python -m compileall scdl step1_preview_blender.py step2_dino_mask.py step3_singlepass_foveated.py`.
+- Full validation (requires Blender 4.5.2 + RTX 3060):
+  1. `./run_windows_blender_wsl.sh` to execute the end-to-end pipeline.
+  2. Inspect `out/scdl_pipeline.log` for device validation, timing summaries, and output locations.
+  3. Confirm `out/final.png` quality while reviewing `user_importance_preview.png` (if enabled).
+
+See `pipeline.md` for a deeper stage-by-stage breakdown and parameter reference.
