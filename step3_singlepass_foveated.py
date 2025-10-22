@@ -65,7 +65,7 @@ def configure_cycles(scene):
     c.adaptive_min_samples = int(os.environ.get("SCDL_ADAPTIVE_MIN_SAMPLES", "32"))
 
     # Optional fast-GI / bounces you already chose
-    c.use_fast_gi = True
+    c.use_fast_gi = False
     c.max_bounces = 8
     c.transparent_max_bounces = 8
 
