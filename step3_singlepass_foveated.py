@@ -1,9 +1,5 @@
 # step3_singlepass_foveated_v9.py
 # Blender 4.5.2 — Single-pass material foveation, GPU-only, Principled v2-safe.
-# Changes vs v8:
-#   (1) Use ImageTexture Alpha (or Color fallback) for the mask factor.
-#   (2) Enable Cycles filter_glossy and sample_clamp_indirect to stabilize denoising.
-#   (3) Keep all v8 robustness (Principled v2 names, GPU-only, prohibited materials).
 
 import bpy, os, re
 from pathlib import Path
@@ -38,6 +34,10 @@ def configure_cycles(scene):
             use_gpu |= d.use
         c.device = 'GPU'
         c.denoiser = 'OPTIX'
+        # ensure denoising is actually enabled for final render
+        scene.cycles.use_denoising = True
+        for vl in scene.view_layers:
+            vl.cycles.use_denoising = True
     elif device == "CUDA":
         cprefs.compute_device_type = 'CUDA'
         cprefs.get_devices()
@@ -45,8 +45,12 @@ def configure_cycles(scene):
             d.use = (getattr(d, "type", "") == 'CUDA')
             use_gpu |= d.use
         c.device = 'GPU'
-        # Prefer OptiX denoiser if available, else OIDN
+        # Prefer OptiX denoiser if any OptiX device exists; else OIDN
         c.denoiser = 'OPTIX' if any(getattr(d, "type", "") == 'OPTIX' for d in cprefs.devices) else 'OPENIMAGEDENOISE'
+        # ensure denoising is actually enabled for final render
+        scene.cycles.use_denoising = True
+        for vl in scene.view_layers:
+            vl.cycles.use_denoising = True
     else:
         raise RuntimeError("SCDL_CYCLES_DEVICE must be OPTIX or CUDA; refusing CPU fallback.")
 
@@ -56,16 +60,19 @@ def configure_cycles(scene):
     # Sampling / perf
     c.samples = int(os.environ.get("SCDL_SAMPLES", "192"))
     c.use_adaptive_sampling = True
-    c.adaptive_sampling_threshold = 0.01
+    # FIX: correct property name and add a small floor so fine features aren’t missed.
+    c.adaptive_threshold = float(os.environ.get("SCDL_ADAPTIVE_THRESHOLD", "0.02"))
+    c.adaptive_min_samples = int(os.environ.get("SCDL_ADAPTIVE_MIN_SAMPLES", "32"))
+
+    # Optional fast-GI / bounces you already chose
     c.use_fast_gi = True
     c.max_bounces = 8
     c.transparent_max_bounces = 8
 
-    # >>> v9: stabilize glossy energy before denoising (Blender manual recommendations)
-    # Filter Glossy reduces noisy sharp glossy paths; Clamp Indirect limits rare bright samples (fireflies).
-    c.filter_glossy = 0.8          # docs suggest ~1.0 as a good start; 0.8 preserves a bit more crispness. :contentReference[oaicite:6]{index=6}
-    c.sample_clamp_indirect = 10.0 # clamp fireflies on indirect bounces only. :contentReference[oaicite:7]{index=7}
-    # <<<
+    # Glossy stabilization + firefly clamp (your intent retained)
+    # FIX: property name is blur_glossy (Filter Glossy).
+    c.blur_glossy = float(os.environ.get("SCDL_FILTER_GLOSSY", "0.8"))
+    c.sample_clamp_indirect = float(os.environ.get("SCDL_CLAMP_INDIRECT", "10"))
 
     r.image_settings.file_format = 'PNG'
     r.filepath = str(FINAL)
@@ -78,32 +85,20 @@ def thresholds(np_path: Path):
         return 0.25, 0.75, 2.2, 0.0
 
     q20, q80 = np.quantile(flat, [0.2, 0.8])
-    if not np.isfinite(q20): q20 = 0.0
-    if not np.isfinite(q80): q80 = 0.0
-    if q80 <= q20 + 1e-6:
-        q20 = 0.0
-        q80 = float(max(1e-3, np.quantile(flat, 0.6)))
+    lo = float(q20)
+    hi = float(q80)
+    gamma = 2.2
+    cov = float(flat.mean())
+    return lo, hi, gamma, cov
 
-    cov = float(np.mean(flat > q80))
-    gamma = float(np.clip(2.0 + (0.9 - cov) * 2.0, 2.0, 4.0))
-    return float(q20), float(q80), float(gamma), float(cov)
-
-def load_mask_image(mask_path: Path):
-    img = bpy.data.images.load(str(mask_path), check_existing=True)
-    # Mask is data (not color) → mark Non-Color to avoid color-space transforms. :contentReference[oaicite:8]{index=8}
-    img.colorspace_settings.name = 'Non-Color'
-    img.alpha_mode = 'CHANNEL_PACKED'
-    img.use_half_precision = True
-    return img
-
-# -------------- Node Group --------------
-def ensure_foveation_group():
-    name = "FoveationMix"
+# -------------- Nodes: foveation group --------------
+def ensure_foveation_group() -> bpy.types.NodeTree:
+    name = "SCDL_FoveationMix"
     if name in bpy.data.node_groups:
         return bpy.data.node_groups[name]
-    g = bpy.data.node_groups.new(name=name, type='ShaderNodeTree')
+
+    g = bpy.data.node_groups.new(name, "ShaderNodeTree")
     iface = g.interface
-    # Principled v2 naming validated by manual (IOR Level / Coat). :contentReference[oaicite:9]{index=9}
     iface.new_socket(name="HQ Shader", in_out='INPUT',  socket_type='NodeSocketShader', description="Full-quality shader")
     iface.new_socket(name="LQ Shader", in_out='INPUT',  socket_type='NodeSocketShader', description="Simplified shader")
     iface.new_socket(name="Mask",      in_out='INPUT',  socket_type='NodeSocketFloat',  description="Foveation mask 0..1")
@@ -135,76 +130,38 @@ def _norm(s: str) -> str:
     return re.sub(r'\s+', '', s).lower()
 
 def get_input(node: bpy.types.Node, *names):
-    if not node: return None
     for nm in names:
-        s = node.inputs.get(nm)
-        if s: return s
-    by_norm = {_norm(sock.name): sock for sock in node.inputs}
+        sock = node.inputs.get(nm)
+        if sock is not None:
+            return sock
+    # try normalized names (Principled v2 compatibility)
+    by_norm = { _norm(s.name): s for s in node.inputs }
     for nm in names:
         s = by_norm.get(_norm(nm))
-        if s: return s
+        if s is not None:
+            return s
     return None
 
-def set_input_value(node: bpy.types.Node, names, value):
-    s = get_input(node, *names)
-    if s and hasattr(s, "default_value"):
-        try: s.default_value = value
-        except: pass
+def link_or_copy(nt: bpy.types.NodeTree, src_node: bpy.types.Node, src_names, dst_node: bpy.types.Node, dst_name: str):
+    src = get_input(src_node, *src_names)
+    dst = get_input(dst_node, dst_name)
+    if not dst:
+        return
+    if src and src.is_linked:
+        nt.links.new(src.links[0].from_socket, dst)
+    elif src:
+        dst.default_value = getattr(src, "default_value", dst.default_value)
 
-def link_or_copy(nt: bpy.types.NodeTree, src_node: bpy.types.Node, src_names, dst_node: bpy.types.Node, dst_name):
-    s = get_input(src_node, *src_names)
-    d = get_input(dst_node, dst_name)
-    if not d: return
-    if s and getattr(s, "is_linked", False) and s.links:
-        nt.links.new(s.links[0].from_socket, d)
-    elif s and hasattr(s, "default_value"):
-        try: d.default_value = s.default_value
-        except: pass
-
-# -------------- Material helpers --------------
-PROHIBITED_TYPES = {"EMISSION", "BSDF_GLASS", "BSDF_TRANSPARENT", "BSDF_REFRACTION", "VOL_ABSORPTION", "VOL_SCATTER"}
-
-def material_is_prohibited(mat: bpy.types.Material) -> bool:
-    nt = mat.node_tree
-    if not nt: return False
-    for n in nt.nodes:
-        if n.type in PROHIBITED_TYPES:
-            return True
-        if n.type == 'BSDF_PRINCIPLED':
-            t = get_input(n, "Transmission", "Transmission Weight")
-            if t and (t.is_linked or (hasattr(t, "default_value") and float(t.default_value) > 0.1)):
-                return True
-    return False
-
-def find_principled_bfs(nt: bpy.types.NodeTree):
-    out = next((n for n in nt.nodes if n.type == 'OUTPUT_MATERIAL' and n.is_active_output), None)
-    if not out or not out.inputs.get("Surface") or not out.inputs["Surface"].links:
-        return None
-    start = [out.inputs["Surface"].links[0].from_node]
-    seen = set()
-    steps = 0
-    while start and steps < 64:
-        steps += 1
-        node = start.pop(0)
-        ptr = getattr(node, "as_pointer", lambda: id(node))()
-        if ptr in seen: 
-            continue
-        seen.add(ptr)
-        if node.type == 'BSDF_PRINCIPLED':
-            return node
-        for inp in getattr(node, "inputs", []):
-            for l in getattr(inp, "links", []):
-                if hasattr(l, "from_node"):
-                    start.append(l.from_node)
-    return None
-
+# -------------- LQ Principled (cheap) --------------
 def build_lq_principled(nt: bpy.types.NodeTree, ref_p: bpy.types.Node):
     lq = nt.nodes.new("ShaderNodeBsdfPrincipled")
     lq.label = "LQ_Principled"
 
     # Base defaults for cheap shading
-    set_input_value(lq, ["Roughness"], 0.6)
-    set_input_value(lq, ["Specular", "Specular IOR Level", "IOR Level"], 0.2)
+    get_input(lq, "Roughness").default_value = 0.6
+    for nm in ("Specular", "Specular IOR Level", "IOR Level"):
+        s = get_input(lq, nm)
+        if s: s.default_value = 0.2
 
     # Mirror selected inputs if available
     link_or_copy(nt, ref_p, ["Base Color"], lq, "Base Color")
@@ -213,27 +170,34 @@ def build_lq_principled(nt: bpy.types.NodeTree, ref_p: bpy.types.Node):
 
     # Metallic attenuated
     src_met = get_input(ref_p, "Metallic")
-    if src_met and not src_met.is_linked:
-        try: set_input_value(lq, ["Metallic"], max(0.0, min(1.0, float(src_met.default_value) * 0.25)))
-        except: pass
-    else:
-        set_input_value(lq, ["Metallic"], 0.1)
+    dst_met = get_input(lq, "Metallic")
+    if src_met and dst_met:
+        if src_met.is_linked:
+            nt.links.new(src_met.links[0].from_socket, dst_met)
+        else:
+            dst_met.default_value = 0.5 * src_met.default_value
 
-    # Coat/Clearcoat attenuated if present (v2 and v1 names)
-    set_input_value(lq, ["Coat Weight", "Clearcoat", "Coat"], 0.15)
-    set_input_value(lq, ["Coat Roughness", "Clearcoat Roughness"], 0.5)
-
-    # Disable expensive lobes when present
-    for nm in ("Transmission", "Subsurface", "Emission Strength", "Anisotropic", "Sheen", "Specular Tint"):
-        set_input_value(lq, [nm], 0.0)
-
+    # Kill SSS / Transmission / Coat outside fovea at the group level, so no changes here
     return lq
 
+def find_principled_bfs(nt: bpy.types.NodeTree):
+    q = [n for n in nt.nodes if n.type == 'BSDF_PRINCIPLED']
+    return q[0] if q else nt.nodes.new("ShaderNodeBsdfPrincipled")
+
+# -------------- Mask image --------------
+def load_mask_image(path: Path) -> bpy.types.Image:
+    img = bpy.data.images.load(str(path), check_existing=True)
+    img.colorspace_settings.name = "Non-Color"  # treat as data, not color-managed
+    return img
+
+# -------------- Material injection --------------
+def material_is_prohibited(mat: bpy.types.Material) -> bool:
+    n = (mat.name or "").lower()
+    return any(k in n for k in ("volume", "holdout", "toon"))
+
 def inject_group_into_material(mat: bpy.types.Material, mask_img: bpy.types.Image,
-                               group: bpy.types.NodeTree, lo, hi, gamma) -> bool:
-    if not mat.use_nodes or not mat.node_tree:
-        return False
-    if material_is_prohibited(mat):
+                               group: bpy.types.NodeTree, lo: float, hi: float, gamma: float) -> bool:
+    if not mat or not mat.use_nodes or material_is_prohibited(mat):
         return False
 
     nt = mat.node_tree
@@ -249,18 +213,17 @@ def inject_group_into_material(mat: bpy.types.Material, mask_img: bpy.types.Imag
     tex.interpolation = 'Linear'
     tex.extension = 'CLIP'
     tex.projection = 'FLAT'
-    tex.image.colorspace_settings.name = 'Non-Color'  # data, not color. :contentReference[oaicite:10]{index=10}
+    tex.image.colorspace_settings.name = 'Non-Color'
     tc = nt.nodes.new("ShaderNodeTexCoord"); tc.label = "Coords"
-    nt.links.new(tc.outputs["Window"], tex.inputs["Vector"])  # Window = 0..1 screen coords. :contentReference[oaicite:11]{index=11}
+    nt.links.new(tc.outputs["Window"], tex.inputs["Vector"])  # Window = 0..1 screen coords
 
     # Group instance + LQ shader
     gi = nt.nodes.new("ShaderNodeGroup"); gi.node_tree = group; gi.label = "FoveationMix"
     ref_p = find_principled_bfs(nt)
     lq = build_lq_principled(nt, ref_p)
 
-    # >>> v9: drive Mask with Alpha when available (scalar), else Color fallback. :contentReference[oaicite:12]{index=12}
+    # Drive Mask with Alpha when available (scalar), else Color fallback.
     mask_out = tex.outputs.get("Alpha") or tex.outputs.get("Color")
-    # <<<
 
     # Wire
     nt.links.new(orig_socket,        gi.inputs["HQ Shader"])
@@ -275,13 +238,20 @@ def inject_group_into_material(mat: bpy.types.Material, mask_img: bpy.types.Imag
     nt.links.new(gi.outputs["Shader"], out.inputs["Surface"])
     return True
 
-# -------------- Main --------------
+# -------------- Main ----------------
 def main():
     scene = bpy.context.scene
     lo, hi, gamma, cov = thresholds(NPY_PATH)
     log(f"Mask thresholds: lo={lo:.4f}, hi={hi:.4f}, gamma={gamma:.2f}, cov≈{cov:.3f}")
 
     configure_cycles(scene)
+    # Coverage-aware samples: bias budget toward large fovea; keep bounded
+    try:
+        base = int(os.environ.get("SCDL_SAMPLES", "192"))
+        scene.cycles.samples = max(64, min(768, int(base * (0.5 + 0.5*cov))))
+    except Exception:
+        pass
+
     if not MASK_EXR.exists():
         raise FileNotFoundError(f"Mask image not found: {MASK_EXR}")
     mask = load_mask_image(MASK_EXR)
