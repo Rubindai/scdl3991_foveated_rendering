@@ -21,7 +21,7 @@ All stages enforce the same invariants:
   - Logs Blender build hash and whether the session runs headless.
 - **Configuration**
   - Resizes the render to keep the short side at `SCDL_PREVIEW_SHORT` (default 448) snapped to 16 px tiles.
-  - Applies deterministic sampling: `SCDL_PREVIEW_SPP`, adaptive sampling thresholds, OPTIX denoiser, glossy filtering, optional clamping.
+  - Applies deterministic sampling: `SCDL_PREVIEW_SPP`, `SCDL_PREVIEW_MIN_SPP`, adaptive sampling thresholds, OPTIX denoiser, glossy filtering, optional clamping, reproducible `SCDL_PREVIEW_SEED`.
 - **Output**
   - Writes `out/preview.png` (PNG, opaque, 8-bit) used as input to Stage 2.
 
@@ -35,7 +35,7 @@ All stages enforce the same invariants:
   2. Preprocesses with a locally cached DINOv3 processor (`SCDL_DINO_LOCAL_DIR`, resize controlled by `SCDL_DINO_SIZE`).
   3. Runs a single BF16 forward pass with Flash Attention.
   4. Converts CLS-patch cosine similarities into a dense saliency map.
-  5. Performs percentile stretch (`SCDL_PERC_LO`, `SCDL_PERC_HI`), gamma shaping (`SCDL_MASK_GAMMA`), and morphological smoothing (`SCDL_MORPH_K`) entirely on-GPU.
+  5. Performs percentile stretch (`SCDL_PERC_LO`, `SCDL_PERC_HI`), gamma shaping (`SCDL_MASK_GAMMA`), and morphological smoothing (`SCDL_MORPH_K`) inside `torch.inference_mode()` to avoid autograd overhead.
 - **Output**
   - Binary artefacts: `user_importance.npy` (float32 H×W) and `user_importance_mask.exr` (single-channel float).
   - Optional preview (`SCDL_USER_IMPORTANCE_PREVIEW`) written via OpenCV in grayscale or viridis overlay.
@@ -50,7 +50,7 @@ All stages enforce the same invariants:
   - Adaptive sampling budgets controlled by `SCDL_FOVEATED_BASE_SPP`, `SCDL_FOVEATED_MIN_SPP`, `SCDL_FOVEATED_MAX_SPP`, and `SCDL_FOVEATED_AUTOSPP`.
   - Material injection:
     - Builds/loads `SCDL_FoveationMix` node group.
-    - Adds a simplified Principled BSDF (LQ shader), preserving base colour/normal links.
+    - Adds or refreshes a simplified Principled BSDF (LQ shader), preserving base colour/normal links.
     - Screenspace mask sampling via `TexCoord (Window)` → EXR mask (non-color data).
   - Coverage from the NPY mask biases the effective adaptive sample count while remaining bounded by min/max.
 - **Output**

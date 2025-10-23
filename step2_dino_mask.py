@@ -228,33 +228,34 @@ def run_saliency(
         last_hidden = outputs.last_hidden_state
 
     with StageTimer("dino.post", logger=logger, records=timings):
-        num_register_tokens = int(getattr(model.config, "num_register_tokens", 0))
-        sal = cls_patch_cosine_saliency(last_hidden, num_register_tokens)
-        batch, patches = sal.shape
-        if batch != 1:
-            raise Step2Error(f"Unexpected batch size from DINOv3 output: {batch}")
+        with torch.inference_mode():
+            num_register_tokens = int(getattr(model.config, "num_register_tokens", 0))
+            sal = cls_patch_cosine_saliency(last_hidden, num_register_tokens)
+            batch, patches = sal.shape
+            if batch != 1:
+                raise Step2Error(f"Unexpected batch size from DINOv3 output: {batch}")
 
-        patch = int(getattr(model.config, "patch_size", 16))
-        in_h, in_w = int(pixel_values.shape[-2]), int(pixel_values.shape[-1])
-        grid_h, grid_w = in_h // patch, in_w // patch
-        if grid_h * grid_w != patches:
-            g = int(round(math.sqrt(patches)))
-            if g * g != patches:
-                raise Step2Error(f"Cannot infer patch grid for {patches} tokens.")
-            grid_h = grid_w = g
+            patch = int(getattr(model.config, "patch_size", 16))
+            in_h, in_w = int(pixel_values.shape[-2]), int(pixel_values.shape[-1])
+            grid_h, grid_w = in_h // patch, in_w // patch
+            if grid_h * grid_w != patches:
+                g = int(round(math.sqrt(patches)))
+                if g * g != patches:
+                    raise Step2Error(f"Cannot infer patch grid for {patches} tokens.")
+                grid_h = grid_w = g
 
-        sal_grid = sal.reshape(1, 1, grid_h, grid_w)
-        sal_full = F.interpolate(sal_grid, size=(height, width), mode="bilinear", align_corners=False)
-        sal_full = (sal_full.clamp(-1, 1) + 1.0) * 0.5
+            sal_grid = sal.reshape(1, 1, grid_h, grid_w)
+            sal_full = F.interpolate(sal_grid, size=(height, width), mode="bilinear", align_corners=False)
+            sal_full = (sal_full.clamp(-1, 1) + 1.0) * 0.5
 
-        sal_full = contrast_stretch(sal_full, cfg.perc_lo, cfg.perc_hi)
-        sal_full = torch.pow(sal_full, cfg.gamma)
+            sal_full = contrast_stretch(sal_full, cfg.perc_lo, cfg.perc_hi)
+            sal_full = torch.pow(sal_full, cfg.gamma)
 
-        kernel = torch.ones(cfg.morph_kernel, cfg.morph_kernel, device=device_obj, dtype=sal_full.dtype)
-        sal_proc = KM.closing(sal_full, kernel)
-        sal_proc = K.filters.gaussian_blur2d(sal_proc, (cfg.morph_kernel, cfg.morph_kernel), (0.5 * cfg.morph_kernel, 0.5 * cfg.morph_kernel))
-        sal_proc = sal_proc.clamp(0, 1).squeeze(0).squeeze(0)
-        mask_np = sal_proc.detach().float().cpu().numpy()
+            kernel = torch.ones(cfg.morph_kernel, cfg.morph_kernel, device=device_obj, dtype=sal_full.dtype)
+            sal_proc = KM.closing(sal_full, kernel)
+            sal_proc = K.filters.gaussian_blur2d(sal_proc, (cfg.morph_kernel, cfg.morph_kernel), (0.5 * cfg.morph_kernel, 0.5 * cfg.morph_kernel))
+            sal_proc = sal_proc.clamp(0, 1).squeeze(0).squeeze(0)
+            mask_np = sal_proc.detach().float().cpu().numpy()
 
     metrics = {"height": height, "width": width}
     return mask_np, image_np, metrics
