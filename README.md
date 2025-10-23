@@ -41,6 +41,33 @@ Each stage:
 
 Outputs land in `out/` (`preview.png`, `user_importance.{npy,exr}`, optional `user_importance_preview.png`, `final.png`, `scdl_pipeline.log`). Override the target directory via `SCDL_OUT_DIR`, or point Step 2 at an alternate preview with `SCDL_PREVIEW_PATH`.
 
+## Benchmarking the Outputs
+To quantify how closely the foveated render matches the full baseline, run the benchmarking utility described in `benchmark/README.md`. The standalone script compares `out/final.png` against `out_full_render/final.png` and reports MSE, PSNR, SSIM, and histogram distances, writing a markdown summary for record keeping.
+
+## Baseline Full Render (Non-foveated)
+
+The repository also ships a baseline render path that reuses the same Blender environment but skips all foveation steps. Use it to generate a ground-truth frame for quality comparisons and timing studies.
+
+```bash
+./run_full_render_wsl.sh                # uses BLEND_FILE from .scdl.env
+./run_full_render_wsl.sh path/to.scene.blend
+```
+
+Behaviour mirrors the main pipeline launcher:
+- Sources `.scdl.env`, validates that `CONDA_DEFAULT_ENV=scdl-foveated`, and enforces `SCDL_CYCLES_DEVICE=OPTIX`.
+- Converts WSL paths for the Windows Blender binary (`BLENDER_EXE`), then launches Blender headless with `full_render_baseline.py`.
+- Logs to `out_full_render/full_render.log` (honouring `SCDL_LOG_MODE` / `SCDL_LOG_FILE`) and prints a timing summary at the end of the run.
+
+Outputs are written to `out_full_render/`:
+- `final.png` (16-bit PNG, full-frame render with uniform sampling).
+- `full_render.log` (structured log with device validation and timings).
+
+Sampling configuration inherits the same Step 3 knobs from `.scdl.env`:
+- `SCDL_FOVEATED_BASE_SPP`, `SCDL_FOVEATED_MIN_SPP`, `SCDL_FOVEATED_MAX_SPP`, `SCDL_ADAPTIVE_THRESHOLD`, `SCDL_ADAPTIVE_MIN_SAMPLES`, `SCDL_FOVEATED_FILTER_GLOSSY`, `SCDL_FOVEATED_CAUSTICS`.
+- Baseline-only controls: set `SCDL_BASELINE_SPP=<int>` to force an explicit sample count, or `SCDL_BASELINE_SPP_SCALE=<float>` to scale the base samples (useful when you want a slower ground truth while keeping the foveated render fast).
+
+Because the baseline render shares the same validation guards (Blender 4.5.2, RTX 3060 OPTIX) and logging, it makes a reliable reference for the benchmarking script.
+
 ## Key Configuration Knobs
 - **Preview (Step 1)** — `SCDL_PREVIEW_SHORT`, `SCDL_PREVIEW_SPP`, `SCDL_PREVIEW_MIN_SPP`, `SCDL_PREVIEW_ADAPTIVE_THRESHOLD`, `SCDL_PREVIEW_DENOISE`, `SCDL_PREVIEW_BLUR_GLOSSY`, optional `SCDL_PREVIEW_CLAMP_DIRECT/INDIRECT`, `SCDL_PREVIEW_SEED`.
 - **DINO Saliency (Step 2)** — `SCDL_DINO_LOCAL_DIR`, `SCDL_DINO_SIZE`, `SCDL_PERC_LO/HI`, `SCDL_MASK_GAMMA`, `SCDL_MORPH_K`, optional `SCDL_MASK_DEVICE` (defaults to `cuda:0` and must remain CUDA).
