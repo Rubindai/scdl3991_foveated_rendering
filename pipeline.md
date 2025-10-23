@@ -14,6 +14,8 @@ All stages enforce the same invariants:
 | Saliency | `step2_dino_mask.py` | `out/preview.png`, DINOv3 weights | `out/user_importance.npy`, `out/user_importance_mask.exr`, optional `out/user_importance_preview.png` | Requires CUDA Flash Attention, BF16, RTX 3060. Runs fully offline (no HF downloads). |
 | Final Render | `step3_singlepass_foveated.py` | `.blend`, saliency mask artefacts | `out/final.png` | Injects foveation node group into every eligible material and renders in a single Cycles pass. |
 
+The `run_windows_blender_wsl.sh` launcher orchestrates these stages, clearing `out/` by default (set `SCDL_CLEAR_OUT_DIR=0` to retain previous artefacts) while funnelling Blender output through the structured logger.
+
 ## Stage 1 – Preview Render (`out/preview.png`)
 - **Validation**
   - Confirms `SCDL_CYCLES_DEVICE` is `OPTIX`.
@@ -35,12 +37,15 @@ All stages enforce the same invariants:
   2. Preprocesses with a locally cached DINOv3 processor (`SCDL_DINO_LOCAL_DIR`, resize controlled by `SCDL_DINO_SIZE`).
   3. Runs a single BF16 forward pass with Flash Attention.
   4. Converts CLS-patch cosine similarities into a dense saliency map.
-  5. Performs percentile stretch (`SCDL_PERC_LO`, `SCDL_PERC_HI`), gamma shaping (`SCDL_MASK_GAMMA`), and morphological smoothing (`SCDL_MORPH_K`) inside `torch.inference_mode()` to avoid autograd overhead.
+  5. Performs percentile stretch (`SCDL_PERC_LO`, `SCDL_PERC_HI`), gamma shaping (`SCDL_MASK_GAMMA`), and then morphological closing + Gaussian blur with kernel size `SCDL_MORPH_K`, all inside `torch.inference_mode()` to avoid autograd overhead.
 - **Output**
   - Binary artefacts: `user_importance.npy` (float32 H×W) and `user_importance_mask.exr` (single-channel float).
   - Optional preview (`SCDL_USER_IMPORTANCE_PREVIEW`) written via OpenCV in grayscale or viridis overlay.
+  - Accepts `SCDL_PREVIEW_PATH` to override the preview input and `SCDL_OUT_DIR` to redirect artefacts.
 - **Timing**
   - `env.validate`, `model.load_processor`, `preview.load`, `dino.preprocess`, `dino.forward`, `dino.post`, `io.save`, and `preview.write` stages captured in the log.
+- **Dependencies**
+  - Requires `OpenEXR`/`Imath` for EXR export and `opencv-python` for overlay generation (all packaged in the Conda environment).
 
 ## Stage 3 – Single-Pass Foveated Render (`out/final.png`)
 - **Validation**
@@ -52,10 +57,11 @@ All stages enforce the same invariants:
     - Builds/loads `SCDL_FoveationMix` node group.
     - Adds or refreshes a simplified Principled BSDF (LQ shader), preserving base colour/normal links.
     - Screenspace mask sampling via `TexCoord (Window)` → EXR mask (non-color data).
+  - Derives low/high thresholds (20/80 quantiles) and fixed gamma 2.2 from `user_importance.npy`, logging `[env] thresholds … coverage=…` before rendering.
   - Coverage from the NPY mask biases the effective adaptive sample count while remaining bounded by min/max.
 - **Output**
   - Final render written to `out/final.png` (PNG, 16-bit).
-  - Console + log emit material injection count and duration for configuration, injection, and render execution.
+  - Console + log emit material injection count, `[env] effective_samples=…`, and duration for configuration, injection, and render execution.
 
 ## Failure Modes
 - Any violation of hardware requirements (missing OPTIX, wrong GPU, disabled BF16) raises a `RuntimeError` with a `[ERROR]` log entry.
@@ -68,4 +74,11 @@ All stages enforce the same invariants:
 3. Inspect `out/scdl_pipeline.log` for:
    - `[device] OPTIX REQUIRED ...` and `[device] CUDA ...` entries.
    - `[timer]` sections per stage (indicates GPU synchronisation succeeded).
+   - Saliency stats (`[env] thresholds … coverage=…`) and `[env] effective_samples=…` before the final render.
    - `[OK]` lines confirming all artefacts were written.
+
+## Reference Run (`blender_files/cookie.blend`)
+- Preview: `784×448`, `[env] samples=16`, `[env] adaptive_min_samples=4`.
+- Saliency: mask resolution matches the preview, `user_importance_preview.png` saved in grayscale, DINO timings ~1.0 s (preprocess + forward + post) with Flash Attention active.
+- Final render: three materials receive `SCDL_FoveationMix`, `effective_samples=104`, render completes in ≈3.7 s with OPTIX denoising.
+- Outputs: `out/preview.png`, `out/user_importance.{npy,exr}`, optional overlay, and `out/final.png` plus consolidated timings in `out/scdl_pipeline.log`.
