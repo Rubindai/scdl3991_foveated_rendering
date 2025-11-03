@@ -323,6 +323,7 @@ def main() -> None:
     logger.info("[step] Step2 DINO saliency starting")
 
     cfg = SaliencyConfig.from_env(paths)
+    expected_gpu = os.getenv("SCDL_EXPECTED_GPU", "RTX 3060")
     log_environment(
         logger,
         {
@@ -340,6 +341,7 @@ def main() -> None:
             "torch_version": torch.__version__,
             "transformers_version": transformers.__version__,
             "kornia_version": getattr(K, "__version__", "unknown"),
+            "expected_gpu": expected_gpu,
         },
     )
 
@@ -349,7 +351,7 @@ def main() -> None:
         device_obj = torch.device(cfg.device)
         torch.cuda.set_device(device_obj)
         with StageTimer("env.validate", logger=logger, records=timings):
-            device_name = torch_device_summary("RTX 3060")
+            device_name = torch_device_summary(expected_gpu)
             torch.set_float32_matmul_precision("high")
             ensure_flash_attention()
         log_devices(logger, [f"CUDA {device_name}"])

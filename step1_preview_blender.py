@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Step 1 — Preview render configured for Blender 4.5.2 + RTX 3060 (OPTIX only)."""
+"""Step 1 — Preview render configured for Blender 4.5.4 LTS + RTX 3060 (OPTIX only)."""
 
 from __future__ import annotations
 
@@ -75,7 +75,7 @@ def read_preview_config() -> PreviewConfig:
     """Read configuration from environment variables and validate values."""
 
     target_short = _require_positive_int(os.getenv("SCDL_PREVIEW_SHORT", "448"), var="SCDL_PREVIEW_SHORT")
-    samples = _require_positive_int(os.getenv("SCDL_PREVIEW_SPP", "16"), var="SCDL_PREVIEW_SPP")
+    samples = _require_positive_int(os.getenv("SCDL_PREVIEW_SPP", "8"), var="SCDL_PREVIEW_SPP")
     adaptive_threshold = float(os.getenv("SCDL_PREVIEW_ADAPTIVE_THRESHOLD", "0.04"))
     adaptive_min_samples = _require_positive_int(os.getenv("SCDL_PREVIEW_MIN_SPP", "4"), var="SCDL_PREVIEW_MIN_SPP")
     denoise = _parse_bool(os.getenv("SCDL_PREVIEW_DENOISE"), default=True, var="SCDL_PREVIEW_DENOISE")
@@ -164,7 +164,13 @@ def configure_output(render: bpy.types.RenderSettings, path: Path) -> None:
     render.filepath = str(path)
 
 
-def log_configuration(logger, cfg: PreviewConfig, resolution: tuple[int, int], devices: Iterable[str]) -> None:
+def log_configuration(
+    logger,
+    cfg: PreviewConfig,
+    resolution: tuple[int, int],
+    devices: Iterable[str],
+    expected_gpu: str,
+) -> None:
     """Emit structured logs describing the configuration."""
 
     rx, ry = resolution
@@ -182,6 +188,7 @@ def log_configuration(logger, cfg: PreviewConfig, resolution: tuple[int, int], d
             "clamp_indirect": cfg.clamp_indirect,
             "caustics": cfg.caustics,
             "seed": cfg.seed,
+            "expected_gpu": expected_gpu,
         },
     )
     log_devices(logger, devices)
@@ -195,7 +202,7 @@ def main() -> None:
 
     logger.info("[step] Step1 preview render starting")
 
-    info = require_blender_version((4, 5, 2))
+    info = require_blender_version((4, 5, 4))
     logger.info("[system] Blender %s (commit %s)", info.version_string, info.build_commit)
     logger.info("[system] Background mode: %s", info.is_background)
 
@@ -203,7 +210,8 @@ def main() -> None:
     if device_override != "OPTIX":
         raise RuntimeError(f"[Step1] SCDL_CYCLES_DEVICE must be OPTIX (received '{device_override}').")
 
-    matched_devices = ensure_optix_device("RTX 3060")
+    expected_gpu = os.getenv("SCDL_EXPECTED_GPU", "RTX 3060")
+    matched_devices = ensure_optix_device(expected_gpu)
     set_cycles_scene_device()
     devices = cycles_devices()
 
@@ -217,7 +225,7 @@ def main() -> None:
         resolution = configure_resolution(scene, cfg.target_short)
         configure_cycles(scene, cfg)
 
-    log_configuration(logger, cfg, resolution, devices)
+    log_configuration(logger, cfg, resolution, devices, expected_gpu)
     if matched_devices:
         log_devices(logger, [f"OPTIX REQUIRED {name}" for name in matched_devices])
 

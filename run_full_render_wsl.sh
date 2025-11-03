@@ -12,6 +12,28 @@ fi
 
 ENV_LOADED=0
 
+append_wslenv_literals() {
+  local key entry current
+  current=":${WSLENV:-}:"
+  for key in "$@"; do
+    entry="${key}/l"
+    case "$current" in
+      *":${entry}:"*|*":${key}:"*)
+        continue
+        ;;
+      *)
+        if [ -n "${WSLENV:-}" ]; then
+          WSLENV="${WSLENV}:${entry}"
+        else
+          WSLENV="${entry}"
+        fi
+        current=":${WSLENV:-}:"
+        ;;
+    esac
+  done
+  export WSLENV
+}
+
 # ======== CONFIG ========
 if [ -f .scdl.env ]; then
   set -a
@@ -19,6 +41,14 @@ if [ -f .scdl.env ]; then
   . ./.scdl.env
   set +a
   ENV_LOADED=1
+fi
+
+if [ "$ENV_LOADED" = "1" ]; then
+  mapfile -t __scdl_wslenv_keys < <(env | awk -F= '/^SCDL_/ {print $1}' | sort -u)
+  if [ "${#__scdl_wslenv_keys[@]}" -gt 0 ]; then
+    append_wslenv_literals "${__scdl_wslenv_keys[@]}"
+  fi
+  unset __scdl_wslenv_keys
 fi
 
 LOG_MODE="${SCDL_LOG_MODE:-both}"
@@ -279,6 +309,12 @@ command -v wslpath >/dev/null 2>&1 || die "wslpath not found. Run under WSL."
 [ -f "$BLEND_FILE" ] || die "Blend file not found: $BLEND_FILE"
 [ -f "$BASELINE_SCRIPT" ] || die "Baseline Blender script missing: $BASELINE_SCRIPT"
 [ -f "$BLENDER_EXE" ] || die "Blender.exe not found at $BLENDER_EXE. Set BLENDER_EXE=/mnt/<drive>/path/to/blender.exe"
+
+REQUIRED_BLENDER_VERSION="4.5.4"
+BLENDER_VERSION_LINE="$("$BLENDER_EXE" --version 2>/dev/null | head -n 1 || true)"
+if [[ "$BLENDER_VERSION_LINE" != *"$REQUIRED_BLENDER_VERSION"* ]]; then
+  die "Blender version mismatch. Expected $REQUIRED_BLENDER_VERSION LTS, got '${BLENDER_VERSION_LINE:-unknown}'. Update BLENDER_EXE to the 4.5.4 LTS binary."
+fi
 
 TOTAL_STEPS=1
 WIN_BLEND_FILE="$(wslpath -w "$PWD/$BLEND_FILE")"

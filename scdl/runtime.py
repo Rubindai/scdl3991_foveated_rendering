@@ -59,6 +59,15 @@ def cycles_devices() -> List[str]:
     return devices
 
 
+def _tokenise_expected(expected_substring: str) -> List[str]:
+    tokens = []
+    for part in expected_substring.replace(",", "|").split("|"):
+        cleaned = part.strip().lower()
+        if cleaned:
+            tokens.append(cleaned)
+    return tokens
+
+
 def ensure_optix_device(expected_substring: str) -> List[str]:
     """Enable only OPTIX devices and ensure one matches the expected GPU."""
 
@@ -67,19 +76,60 @@ def ensure_optix_device(expected_substring: str) -> List[str]:
 
     prefs = bpy.context.preferences.addons["cycles"].preferences
     prefs.compute_device_type = "OPTIX"
+    if hasattr(prefs, "refresh_devices"):
+        prefs.refresh_devices()
     prefs.get_devices()
 
+    expected_tokens = _tokenise_expected(expected_substring)
     matched_devices: List[str] = []
+    available_optix: List[str] = []
+
+    def _is_optix(dev) -> bool:
+        return getattr(dev, "type", "").upper() == "OPTIX"
+
+    optix_candidates: List = []
+    if hasattr(prefs, "get_devices_for_type"):
+        try:
+            optix_candidates = list(prefs.get_devices_for_type("OPTIX"))
+        except Exception:
+            optix_candidates = []
+
     for device in prefs.devices:
         is_optix = getattr(device, "type", "") == "OPTIX"
         device.use = bool(is_optix)
-        if is_optix and expected_substring.lower() in device.name.lower():
-            matched_devices.append(device.name)
+        if is_optix:
+            available_optix.append(device.name)
+            device_name_lower = device.name.lower()
+            if not expected_tokens or any(token in device_name_lower for token in expected_tokens):
+                matched_devices.append(device.name)
 
     if not matched_devices:
+        for device in optix_candidates:
+            available_optix.append(device.name)
+            device_name_lower = device.name.lower()
+            if not expected_tokens or any(token in device_name_lower for token in expected_tokens):
+                matched_devices.append(device.name)
+
+    if not matched_devices:
+        runtime_hint = ""
+        has_optix_runtime = None
+        if hasattr(prefs, "has_optixdenoiser_gpu_devices"):
+            try:
+                has_optix_runtime = bool(prefs.has_optixdenoiser_gpu_devices())
+            except TypeError:
+                has_optix_runtime = None
+        if has_optix_runtime is False:
+            runtime_hint = (
+                " OptiX runtime not detected on this system. On Linux, install "
+                "the NVIDIA OptiX SDK (liboptix.so.1) and ensure the proprietary "
+                "driver is active."
+            )
+        available_str = ", ".join(available_optix) if available_optix else "none"
         raise RuntimeError(
-            f"No OPTIX device matching '{expected_substring}' detected. "
+            f"No OPTIX device matching '{expected_substring}' detected "
+            f"(available OPTIX devices: {available_str}). "
             "This pipeline forbids falling back to CUDA or CPU."
+            + runtime_hint
         )
     return matched_devices
 
@@ -111,7 +161,9 @@ def torch_device_summary(expected_substring: str, *, require_bf16: bool = True) 
     device_index = torch.cuda.current_device()
     device_name = torch.cuda.get_device_name(device_index)
 
-    if expected_substring.lower() not in device_name.lower():
+    expected_tokens = _tokenise_expected(expected_substring)
+    device_name_lower = device_name.lower()
+    if expected_tokens and not any(token in device_name_lower for token in expected_tokens):
         raise RuntimeError(
             f"Expected CUDA device containing '{expected_substring}', found '{device_name}'."
         )

@@ -1,8 +1,9 @@
 # Pipeline Breakdown
 
 All stages enforce the same invariants:
-- Blender must be 4.5.2 LTS.
+- Blender must be 4.5.4 LTS.
 - The active render device must be an NVIDIA RTX 3060 using OPTIX; CUDA/CPU/CPU+OIDN fallbacks are rejected.
+- The expected GPU substring comes from `SCDL_EXPECTED_GPU` (defaults to `RTX 3060`) and is checked in every stage.
 - Logs are routed through `scdl.logging.get_logger`, yielding `[step]`, `[env]`, `[device]`, and `[timer]` tagged output in both the terminal and `out/scdl_pipeline.log`.
 - GPU-aware timings are captured with `scdl.StageTimer` so reported durations include CUDA synchronisation points.
 
@@ -14,12 +15,12 @@ All stages enforce the same invariants:
 | Saliency | `step2_dino_mask.py` | `out/preview.png`, DINOv3 weights | `out/user_importance.npy`, `out/user_importance_mask.exr`, optional `out/user_importance_preview.png` | Requires CUDA Flash Attention, BF16, RTX 3060. Runs fully offline (no HF downloads). |
 | Final Render | `step3_singlepass_foveated.py` | `.blend`, saliency mask artefacts | `out/final.png` | Injects foveation node group into every eligible material and renders in a single Cycles pass. |
 
-The `run_windows_blender_wsl.sh` launcher orchestrates these stages, clearing `out/` by default (set `SCDL_CLEAR_OUT_DIR=0` to retain previous artefacts) while funnelling Blender output through the structured logger.
+The `run_linux_blender.sh` launcher orchestrates these stages on native Ubuntu (clearing `out/` by default; set `SCDL_CLEAR_OUT_DIR=0` to retain artefacts) while funnelling Blender output through the structured logger. When Windows Blender is required, `run_windows_blender_wsl.sh` provides equivalent behaviour through WSL.
 
 ## Stage 1 – Preview Render (`out/preview.png`)
 - **Validation**
   - Confirms `SCDL_CYCLES_DEVICE` is `OPTIX`.
-  - Enables only OPTIX devices and verifies the RTX 3060 is active.
+  - Enables only OPTIX devices and verifies the GPU string matches `SCDL_EXPECTED_GPU`.
   - Logs Blender build hash and whether the session runs headless.
 - **Configuration**
   - Resizes the render to keep the short side at `SCDL_PREVIEW_SHORT` (default 448) snapped to 16 px tiles.
@@ -30,7 +31,7 @@ The `run_windows_blender_wsl.sh` launcher orchestrates these stages, clearing `o
 ## Stage 2 – DINOv3 Saliency (`out/user_importance*`)
 - **Validation**
   - Optional `SCDL_MASK_DEVICE` must remain on CUDA (defaults to `cuda:0`).
-  - Calls `torch_device_summary("RTX 3060")` and `ensure_flash_attention()` to guarantee Flash Attention availability.
+  - Calls `torch_device_summary` with `SCDL_EXPECTED_GPU` and `ensure_flash_attention()` to guarantee Flash Attention availability.
   - Logs PyTorch, Transformers, and Kornia versions alongside the active device name.
 - **Processing**
   1. Loads the preview PNG into GPU memory (`TorchVision`), with timing tracked via `StageTimer`.
@@ -49,7 +50,7 @@ The `run_windows_blender_wsl.sh` launcher orchestrates these stages, clearing `o
 
 ## Stage 3 – Single-Pass Foveated Render (`out/final.png`)
 - **Validation**
-  - Enforces OPTIX-only rendering and re-validates the RTX 3060.
+  - Enforces OPTIX-only rendering and re-validates the GPU against `SCDL_EXPECTED_GPU`.
   - Checks the existence of both `user_importance_mask.exr` and `user_importance.npy`.
 - **Configuration**
   - Adaptive sampling budgets controlled by `SCDL_FOVEATED_BASE_SPP`, `SCDL_FOVEATED_MIN_SPP`, `SCDL_FOVEATED_MAX_SPP`, and `SCDL_FOVEATED_AUTOSPP`.
@@ -70,7 +71,7 @@ The `run_windows_blender_wsl.sh` launcher orchestrates these stages, clearing `o
 
 ## Verification Checklist
 1. Run `python -m compileall scdl step1_preview_blender.py step2_dino_mask.py step3_singlepass_foveated.py` to confirm syntax.
-2. Execute the pipeline via `./run_windows_blender_wsl.sh`.
+2. Execute the pipeline via `./run_linux_blender.sh` (or `./run_windows_blender_wsl.sh` when running the Windows Blender build).
 3. Inspect `out/scdl_pipeline.log` for:
    - `[device] OPTIX REQUIRED ...` and `[device] CUDA ...` entries.
    - `[timer]` sections per stage (indicates GPU synchronisation succeeded).

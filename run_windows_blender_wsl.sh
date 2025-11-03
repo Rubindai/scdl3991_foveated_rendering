@@ -12,6 +12,28 @@ fi
 
 ENV_LOADED=0
 
+append_wslenv_literals() {
+  local key entry current
+  current=":${WSLENV:-}:"
+  for key in "$@"; do
+    entry="${key}/l"
+    case "$current" in
+      *":${entry}:"*|*":${key}:"*)
+        continue
+        ;;
+      *)
+        if [ -n "${WSLENV:-}" ]; then
+          WSLENV="${WSLENV}:${entry}"
+        else
+          WSLENV="${entry}"
+        fi
+        current=":${WSLENV:-}:"
+        ;;
+    esac
+  done
+  export WSLENV
+}
+
 # ======== CONFIG ========
 # Optional: auto-load repo-local env overrides (e.g., SCDL_USE_GPU, SCDL_HALTTIME, etc.)
 if [ -f .scdl.env ]; then
@@ -20,6 +42,15 @@ if [ -f .scdl.env ]; then
   . ./.scdl.env
   set +a
   ENV_LOADED=1
+fi
+
+if [ "$ENV_LOADED" = "1" ]; then
+  # Ensure SCDL_* variables propagate to Windows executables launched from WSL.
+  mapfile -t __scdl_wslenv_keys < <(env | awk -F= '/^SCDL_/ {print $1}' | sort -u)
+  if [ "${#__scdl_wslenv_keys[@]}" -gt 0 ]; then
+    append_wslenv_literals "${__scdl_wslenv_keys[@]}"
+  fi
+  unset __scdl_wslenv_keys
 fi
 
 LOG_MODE="${SCDL_LOG_MODE:-both}"
@@ -177,6 +208,9 @@ log_done() { log_emit "$COLOR_OK" "[DONE]" "$*"; }
 
 if [ -n "$OUT_CLEAR_NOTE" ]; then
   log_info "$OUT_CLEAR_NOTE"
+fi
+if [ -n "${SCDL_EXPECTED_GPU:-}" ]; then
+  log_env "SCDL_EXPECTED_GPU=${SCDL_EXPECTED_GPU}"
 fi
 
 filter_blender_output() {

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Standalone full-frame render baseline (no foveation) for Blender 4.5.2 + RTX 3060 (OPTIX only)."""
+"""Standalone full-frame render baseline (no foveation) for Blender 4.5.4 LTS + RTX 3060 (OPTIX only)."""
 
 from __future__ import annotations
 
@@ -167,7 +167,7 @@ def configure_cycles(scene: bpy.types.Scene, cfg: FullRenderConfig) -> int:
     return effective
 
 
-def log_configuration(logger, cfg: FullRenderConfig, paths: BaselinePaths) -> None:
+def log_configuration(logger, cfg: FullRenderConfig, paths: BaselinePaths, expected_gpu: str) -> None:
     """Emit environment and render configuration details."""
 
     log_environment(
@@ -186,6 +186,7 @@ def log_configuration(logger, cfg: FullRenderConfig, paths: BaselinePaths) -> No
             "auto_samples": cfg.auto_samples,
             "caustics": cfg.caustics,
             "assumed_coverage": 1.0,
+            "expected_gpu": expected_gpu,
         },
     )
 
@@ -208,7 +209,7 @@ def main() -> None:
     logger = get_logger("scdl.full_render_baseline", default_path=paths.log_file)
     logger.info("[step] Baseline full-frame render starting")
 
-    info = require_blender_version((4, 5, 2))
+    info = require_blender_version((4, 5, 4))
     logger.info("[system] Blender %s (commit %s)", info.version_string, info.build_commit)
     logger.info("[system] Background mode: %s", info.is_background)
 
@@ -216,12 +217,13 @@ def main() -> None:
     if device_override != "OPTIX":
         raise RuntimeError(f"[Baseline] SCDL_CYCLES_DEVICE must be OPTIX (received '{device_override}').")
 
-    matched_devices = ensure_optix_device("RTX 3060")
+    expected_gpu = os.getenv("SCDL_EXPECTED_GPU", "RTX 3060")
+    matched_devices = ensure_optix_device(expected_gpu)
     set_cycles_scene_device()
     devices = cycles_devices()
 
     cfg = FullRenderConfig.from_env()
-    log_configuration(logger, cfg, paths)
+    log_configuration(logger, cfg, paths, expected_gpu)
     log_devices(logger, devices)
     if matched_devices:
         log_devices(logger, [f"OPTIX REQUIRED {name}" for name in matched_devices])

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Step 3 — Single-pass foveated render for Blender 4.5.2 + RTX 3060 (OPTIX only)."""
+"""Step 3 — Single-pass foveated render for Blender 4.5.4 LTS + RTX 3060 (OPTIX only)."""
 
 from __future__ import annotations
 
@@ -374,14 +374,15 @@ def main() -> None:
     logger = get_logger("scdl.step3.foveated", default_path=paths.log_file)
     logger.info("[step] Step3 single-pass render starting")
 
-    info = require_blender_version((4, 5, 2))
+    info = require_blender_version((4, 5, 4))
     logger.info("[system] Blender %s (commit %s)", info.version_string, info.build_commit)
 
     device_override = os.getenv("SCDL_CYCLES_DEVICE", "OPTIX").strip().upper()
     if device_override != "OPTIX":
         raise RuntimeError(f"[Step3] SCDL_CYCLES_DEVICE must be OPTIX (received '{device_override}').")
 
-    matched_devices = ensure_optix_device("RTX 3060")
+    expected_gpu = os.getenv("SCDL_EXPECTED_GPU", "RTX 3060")
+    matched_devices = ensure_optix_device(expected_gpu)
     set_cycles_scene_device()
     devices = cycles_devices()
     log_devices(logger, devices)
@@ -402,6 +403,7 @@ def main() -> None:
             "clamp_indirect": cfg.clamp_indirect,
             "auto_samples": cfg.auto_samples,
             "caustics": cfg.caustics,
+            "expected_gpu": expected_gpu,
         },
     )
 
