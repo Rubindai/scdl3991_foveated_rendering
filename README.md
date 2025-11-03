@@ -60,11 +60,11 @@ To quantify how closely the foveated render matches the full baseline, run the b
 The repository also ships a baseline render path that reuses the same Blender environment but skips all foveation steps. Use it to generate a ground-truth frame for quality comparisons and timing studies.
 
 ```bash
-blender -b blender_files/car2.blend -P full_render_baseline.py
-blender -b path/to.scene.blend -P full_render_baseline.py
+./run_linux_full_render.sh                  # native Linux baseline render
+./run_linux_full_render.sh path/to.scene.blend
 ```
 
-When Windows Blender must be used, `run_full_render_wsl.sh` mirrors the same behaviour (loading `.scdl.env`, enforcing OPTIX, capturing timings).
+If you need to target Windows Blender, `run_full_render_wsl.sh` mirrors the same behaviour (loading `.scdl.env`, enforcing OPTIX, capturing timings).
 
 Outputs are written to `out_full_render/`:
 - `final.png` (16-bit PNG, full-frame render with uniform sampling).
