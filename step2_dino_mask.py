@@ -78,7 +78,7 @@ class SaliencyConfig:
         gamma = float(os.getenv("SCDL_MASK_GAMMA", "0.70"))
         morph_kernel = _env_positive_int("SCDL_MORPH_K", default=3)
 
-        local_dir = os.getenv("SCDL_DINO_LOCAL_DIR", "models/dinov3-vitl16").strip()
+        local_dir = os.getenv("SCDL_DINO_LOCAL_DIR", "models/dinov3-vits16").strip()
         if not local_dir:
             raise Step2Error("SCDL_DINO_LOCAL_DIR must point to a local DINOv3 repository.")
         preview_override = os.getenv("SCDL_PREVIEW_PATH", "")
