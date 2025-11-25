@@ -17,6 +17,9 @@ dependencies:
   - pip
   - pip:
       - opencv-python>=4.9
+      - lpips
+      - scikit-image
+      - matplotlib
       - torchmetrics>=1.4
       - ftfy
       - omegaconf

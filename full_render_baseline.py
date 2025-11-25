@@ -47,30 +47,43 @@ class FullRenderConfig:
     filter_glossy: float
     clamp_direct: Optional[float]
     clamp_indirect: Optional[float]
-    auto_samples: bool
     caustics: bool
+    light_tree: bool
+    light_sampling_threshold: float
+    max_bounces: int
+    transparent_max_bounces: int
 
     @classmethod
     def from_env(cls) -> "FullRenderConfig":
         """Parse configuration using the same knobs as the foveated pipeline."""
 
-        base_samples = _env_positive_int("SCDL_FOVEATED_BASE_SPP", default=192)
-        min_samples = _env_positive_int("SCDL_FOVEATED_MIN_SPP", default=32)
-        max_samples = _env_positive_int("SCDL_FOVEATED_MAX_SPP", default=768)
+        base_samples = _env_positive_int("SCDL_BASELINE_SPP", default=512)
+        base_scale_raw = os.getenv("SCDL_BASELINE_SPP_SCALE", "1.0").strip()
+        try:
+            base_scale = float(base_scale_raw)
+        except ValueError as exc:
+            raise RuntimeError(f"[Baseline] SCDL_BASELINE_SPP_SCALE must be a float (received '{base_scale_raw}').") from exc
+        base_samples = int(round(base_samples * base_scale))
+
+        min_samples = _env_positive_int("SCDL_BASELINE_MIN_SPP", default=_env_positive_int("SCDL_FOVEATED_MIN_SPP", default=32))
+        max_samples = _env_positive_int("SCDL_BASELINE_MAX_SPP", default=_env_positive_int("SCDL_FOVEATED_MAX_SPP", default=2048))
         adaptive_threshold = float(os.getenv("SCDL_ADAPTIVE_THRESHOLD", "0.02"))
         adaptive_min_samples = _env_positive_int("SCDL_ADAPTIVE_MIN_SAMPLES", default=min_samples)
         filter_glossy = float(os.getenv("SCDL_FOVEATED_FILTER_GLOSSY", "0.8"))
         clamp_direct = _env_optional_float("SCDL_FOVEATED_CLAMP_DIRECT")
         clamp_indirect = _env_optional_float("SCDL_FOVEATED_CLAMP_INDIRECT")
-        auto_samples = _env_bool("SCDL_FOVEATED_AUTOSPP", default=True)
         caustics = _env_bool("SCDL_FOVEATED_CAUSTICS", default=False)
+        light_tree = _env_bool("SCDL_FOVEATED_LIGHT_TREE", default=True)
+        light_sampling_threshold = float(os.getenv("SCDL_FOVEATED_LIGHT_SAMPLING_THRESHOLD", "0.01"))
+        max_bounces = _env_positive_int("SCDL_FOVEATED_MAX_BOUNCES", default=8)
+        transparent_max_bounces = _env_positive_int("SCDL_FOVEATED_TRANSPARENT_BOUNCES", default=max_bounces)
 
         if min_samples > base_samples:
-            raise RuntimeError("[Baseline] SCDL_FOVEATED_MIN_SPP cannot exceed SCDL_FOVEATED_BASE_SPP.")
+            raise RuntimeError("[Baseline] SCDL_BASELINE_MIN_SPP cannot exceed SCDL_BASELINE_SPP.")
         if max_samples < base_samples:
-            raise RuntimeError("[Baseline] SCDL_FOVEATED_MAX_SPP cannot be lower than SCDL_FOVEATED_BASE_SPP.")
+            raise RuntimeError("[Baseline] SCDL_BASELINE_MAX_SPP cannot be lower than SCDL_BASELINE_SPP.")
         if adaptive_min_samples < min_samples:
-            raise RuntimeError("[Baseline] SCDL_ADAPTIVE_MIN_SAMPLES must be ≥ SCDL_FOVEATED_MIN_SPP.")
+            raise RuntimeError("[Baseline] SCDL_ADAPTIVE_MIN_SAMPLES must be ≥ SCDL_BASELINE_MIN_SPP.")
 
         return cls(
             base_samples=base_samples,
@@ -81,8 +94,11 @@ class FullRenderConfig:
             filter_glossy=filter_glossy,
             clamp_direct=clamp_direct,
             clamp_indirect=clamp_indirect,
-            auto_samples=auto_samples,
             caustics=caustics,
+            light_tree=light_tree,
+            light_sampling_threshold=light_sampling_threshold,
+            max_bounces=max_bounces,
+            transparent_max_bounces=transparent_max_bounces,
         )
 
 
@@ -141,14 +157,18 @@ def configure_cycles(scene: bpy.types.Scene, cfg: FullRenderConfig) -> int:
     cycles = scene.cycles
     cycles.device = "GPU"
     cycles.use_fast_gi = False
-    cycles.max_bounces = 8
-    cycles.transparent_max_bounces = 8
+    cycles.max_bounces = cfg.max_bounces
+    cycles.transparent_max_bounces = cfg.transparent_max_bounces
     cycles.caustics_reflective = cfg.caustics
     cycles.caustics_refractive = cfg.caustics
 
     cycles.use_adaptive_sampling = True
     cycles.adaptive_threshold = cfg.adaptive_threshold
     cycles.adaptive_min_samples = cfg.adaptive_min_samples
+    if hasattr(cycles, "use_light_tree"):
+        cycles.use_light_tree = cfg.light_tree
+    if hasattr(cycles, "light_sampling_threshold"):
+        cycles.light_sampling_threshold = cfg.light_sampling_threshold
 
     effective = max(cfg.min_samples, min(cfg.max_samples, cfg.base_samples))
     cycles.samples = effective
@@ -183,8 +203,11 @@ def log_configuration(logger, cfg: FullRenderConfig, paths: BaselinePaths, expec
             "filter_glossy": cfg.filter_glossy,
             "clamp_direct": cfg.clamp_direct,
             "clamp_indirect": cfg.clamp_indirect,
-            "auto_samples": cfg.auto_samples,
             "caustics": cfg.caustics,
+            "light_tree": cfg.light_tree,
+            "light_sampling_threshold": cfg.light_sampling_threshold,
+            "max_bounces": cfg.max_bounces,
+            "transparent_bounces": cfg.transparent_max_bounces,
             "assumed_coverage": 1.0,
             "expected_gpu": expected_gpu,
         },

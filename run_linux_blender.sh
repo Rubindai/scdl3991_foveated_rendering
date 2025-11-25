@@ -223,6 +223,13 @@ if [ -n "${SCDL_EXPECTED_GPU:-}" ]; then
   log_env "SCDL_EXPECTED_GPU=${SCDL_EXPECTED_GPU}"
 fi
 
+# Ensure Blender can launch the correct Python for Step 2 (DINO).
+if [ -z "${SCDL_PYTHON_EXE:-}" ]; then
+  export SCDL_PYTHON_EXE
+  SCDL_PYTHON_EXE="$(command -v python)"
+  log_info "SCDL_PYTHON_EXE defaulted to ${SCDL_PYTHON_EXE}"
+fi
+
 die() {
   log_error "$*"
   exit 1
@@ -250,8 +257,8 @@ DINO_SCRIPT="$SCRIPT_DIR/step2_dino_mask.py"
 [ -f "$FINAL_SCRIPT" ] || die "Missing $FINAL_SCRIPT"
 [ -f "$DINO_SCRIPT" ] || die "Missing $DINO_SCRIPT"
 
-TOTAL_STEPS=3
 BLENDER_ARGS=(--factory-startup --addons cycles)
+TOTAL_STEPS=3
 
 # ----- Step 1 -----
 STEP=1
@@ -282,7 +289,7 @@ if [ -n "${SCDL_DINO_PYTHON:-}" ]; then
   DINO_CMD=("${SCDL_DINO_PYTHON}" "$DINO_SCRIPT")
   log_info "Using explicit SCDL_DINO_PYTHON=${SCDL_DINO_PYTHON}"
 else
-  DINO_CMD=(python "$DINO_SCRIPT")
+  DINO_CMD=("${SCDL_PYTHON_EXE:-python}" "$DINO_SCRIPT")
 fi
 log_cmd_array "${DINO_CMD[@]}"
 _step_start=$(date +%s)

@@ -1,49 +1,30 @@
-# Benchmarking Foveated vs. Full Renders
+# Benchmark Sweep
 
-This directory contains utilities for quantifying how closely the foveated render matches the full baseline. The entry-point script, `benchmark_images.py`, compares two rendered frames and reports common image-similarity metrics.
+Generates LPIPS, SSIM, and PSNR curves for foveated vs. baseline renders, using the final full render (`out_full_render/final.png`) as the reference point.
 
-## Prerequisites
-- Python 3.10+ (the same Conda env used for the pipeline already ships Pillow and NumPy).
-- Completed renders saved to:
-  - `out_full_render/final.png` (baseline, produced by `run_full_render_wsl.sh`)
-  - `out/final.png` (foveated pipeline output)
-
-> **Tip:** If you keep multiple variants, use the `--full-name` / `--foveated-name` flags to target specific files.
-
-## Usage
-
+## Quick Start
 ```bash
 conda activate scdl-foveated
-python benchmark/benchmark_images.py
+python benchmark/benchmark_sweep.py \
+  --spp-start 0 \
+  --spp-step 32
 ```
 
-Default behaviour:
-- Looks for the baseline image in `/home/rubin/uni/scdl3991_foveated_rendering/out_full_render`.
-- Looks for the foveated image in `/home/rubin/uni/scdl3991_foveated_rendering/out`.
-- Writes `benchmark_results.md` next to the script (i.e., inside `benchmark/`).
+This:
+- Uses your settings to derive the end of each curve (baseline cap = clamped `SCDL_BASELINE_SPP`, foveated cap = clamped `SCDL_FOVEATED_BASE_SPP`; both start at 0, and any SPP above the cap is skipped).
+- Renders both modes at the requested SPP levels (skipping levels above each mode’s effective cap).
+- Forces foveated sweeps to use exact SPP counts (`SCDL_FOVEATED_AUTOSPP=0`) for clean x-axis control.
+- Computes LPIPS/SSIM/PSNR against `out_full_render/final.png`.
+- Writes results to `benchmark_sweep_out/metrics.json` and plots `lpips.png`, `ssim.png`, `psnr.png` in the same directory.
 
-### CLI Options
+Set `--no-render` to reuse existing renders in `benchmark_sweep_out/renders/`.
 
-| Flag | Description |
-|------|-------------|
-| `--full-dir PATH` | Override the directory containing the full baseline image. |
-| `--foveated-dir PATH` | Override the directory containing the foveated image. |
-| `--output-dir PATH` | Redirect where the markdown report is written. |
-| `--full-name NAME` | Force a specific filename inside `--full-dir`. |
-| `--foveated-name NAME` | Force a specific filename inside `--foveated-dir`. |
+## Requirements
+- Baseline reference already rendered (run `./run_linux_full_render.sh` first).
+- Mask artefacts present (`out/user_importance.npy` / `user_importance_mask.exr`) for foveated sweeps.
+- Blender path via `SCDL_LINUX_BLENDER_EXE` or `BLENDER_EXE`.
 
-## Reported Metrics
-- **MSE** — Mean Squared Error (0.0 = identical, lower is better).
-- **PSNR (dB)** — Peak Signal-to-Noise Ratio (higher is better).
-- **SSIM** — Structural Similarity Index (1.0 = identical).
-- **Histogram L1 Distance** — Per-channel colour histogram difference (0.0 = identical, lower is better).
-
-Results appear both in the terminal (as a monospace table) and in `benchmark_results.md`, making it easy to track changes over time or share results.
-
-## Error Handling
-The script exits cleanly with descriptive messages when:
-- Expected directories are missing.
-- Multiple candidate images are found (unless a filename override is supplied).
-- Image dimensions or channel layouts differ.
-
-Resolve the issue and re-run the command; the markdown report is regenerated on every successful invocation.
+### Environment knobs
+- Baseline cap: clamped `SCDL_BASELINE_SPP` (default 512) with optional `SCDL_BASELINE_SPP_SCALE`, bounded by `SCDL_BASELINE_MIN_SPP`/`SCDL_BASELINE_MAX_SPP`.
+- Foveated cap: clamped `SCDL_FOVEATED_BASE_SPP` (default 192) bounded by `SCDL_FOVEATED_MIN_SPP`/`SCDL_FOVEATED_MAX_SPP`.
+- `BLEND_FILE` is read from `.scdl.env` if `--blend` is omitted.

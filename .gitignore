@@ -5,3 +5,5 @@ export
 dinov3
 blender_files
 trys/*
+
+benchmark_sweep_out

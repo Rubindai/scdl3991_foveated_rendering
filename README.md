@@ -53,7 +53,7 @@ Each stage:
 Outputs land in `out/` (`preview.png`, `user_importance.{npy,exr}`, optional `user_importance_preview.png`, `final.png`, `scdl_pipeline.log`). Override the target directory via `SCDL_OUT_DIR`, or point Step 2 at an alternate preview with `SCDL_PREVIEW_PATH`.
 
 ## Benchmarking the Outputs
-To quantify how closely the foveated render matches the full baseline, run the benchmarking utility described in `benchmark/README.md`. The standalone script compares `out/final.png` against `out_full_render/final.png` and reports MSE, PSNR, SSIM, and histogram distances, writing a markdown summary for record keeping.
+Use `benchmark/benchmark_sweep.py` (documented in `benchmark/README.md`) to render sweeps for baseline and foveated modes, then plot LPIPS/SSIM/PSNR against the full-render reference (`out_full_render/final.png`). It honours your requested SPP range (starts at 0 on the x-axis and skips any levels beyond each mode’s effective cap), forces exact SPP on foveated sweeps, and writes metrics/plots to `benchmark_sweep_out/`.
 
 ## Baseline Full Render (Non-foveated)
 
@@ -70,16 +70,15 @@ Outputs are written to `out_full_render/`:
 - `final.png` (16-bit PNG, full-frame render with uniform sampling).
 - `full_render.log` (structured log with device validation and timings).
 
-Sampling configuration inherits the same Step 3 knobs from `.scdl.env`:
-- `SCDL_FOVEATED_BASE_SPP`, `SCDL_FOVEATED_MIN_SPP`, `SCDL_FOVEATED_MAX_SPP`, `SCDL_ADAPTIVE_THRESHOLD`, `SCDL_ADAPTIVE_MIN_SAMPLES`, `SCDL_FOVEATED_FILTER_GLOSSY`, `SCDL_FOVEATED_CAUSTICS`.
-- Baseline-only controls: set `SCDL_BASELINE_SPP=<int>` to force an explicit sample count, or `SCDL_BASELINE_SPP_SCALE=<float>` to scale the base samples (useful when you want a slower ground truth while keeping the foveated render fast).
+Sampling configuration mirrors the foveated stage (adaptive threshold, clamp, denoise, caustics, light tree, bounces) but uses its own higher budget:
+- `SCDL_BASELINE_SPP` (default 512, scaled by optional `SCDL_BASELINE_SPP_SCALE`), `SCDL_BASELINE_MIN_SPP`, `SCDL_BASELINE_MAX_SPP`, `SCDL_ADAPTIVE_THRESHOLD`, `SCDL_ADAPTIVE_MIN_SAMPLES`, `SCDL_FOVEATED_FILTER_GLOSSY`, `SCDL_FOVEATED_CAUSTICS`, `SCDL_FOVEATED_LIGHT_TREE`, `SCDL_FOVEATED_LIGHT_SAMPLING_THRESHOLD`, `SCDL_FOVEATED_MAX_BOUNCES`, `SCDL_FOVEATED_TRANSPARENT_BOUNCES`.
 
 Because the baseline render shares the same validation guards (Blender 4.5.4, RTX 3060 OPTIX) and logging, it makes a reliable reference for the benchmarking script.
 
 ## Key Configuration Knobs
 - **Preview (Step 1)** — `SCDL_PREVIEW_SHORT`, `SCDL_PREVIEW_SPP`, `SCDL_PREVIEW_MIN_SPP`, `SCDL_PREVIEW_ADAPTIVE_THRESHOLD`, `SCDL_PREVIEW_DENOISE`, `SCDL_PREVIEW_BLUR_GLOSSY`, optional `SCDL_PREVIEW_CLAMP_DIRECT/INDIRECT`, `SCDL_PREVIEW_SEED`.
 - **DINO Saliency (Step 2)** — `SCDL_DINO_LOCAL_DIR`, `SCDL_DINO_SIZE`, `SCDL_PERC_LO/HI`, `SCDL_MASK_GAMMA`, `SCDL_MORPH_K`, optional `SCDL_MASK_DEVICE` (defaults to `cuda:0` and must remain CUDA).
-- **Final Render (Step 3)** — `SCDL_FOVEATED_BASE_SPP/MIN_SPP/MAX_SPP`, `SCDL_ADAPTIVE_THRESHOLD`, `SCDL_ADAPTIVE_MIN_SAMPLES`, `SCDL_FOVEATED_FILTER_GLOSSY`.
+- **Final Render (Step 3)** — `SCDL_FOVEATED_BASE_SPP/MIN_SPP/MAX_SPP`, `SCDL_ADAPTIVE_THRESHOLD`, `SCDL_ADAPTIVE_MIN_SAMPLES`, `SCDL_FOVEATED_ADAPTIVE_BOOST` (scales the adaptive threshold up as coverage shrinks), `SCDL_FOVEATED_ADAPTIVE_MIN_FRACTION` (how far the adaptive-min floor can drop in LQ-heavy scenes), `SCDL_FOVEATED_FILTER_GLOSSY`, the autospp curve (`SCDL_FOVEATED_AUTOSPP_FLOOR`/`AUTOSPP_TAPER`/`AUTOSPP_GAMMA`) plus `SCDL_FOVEATED_IMPORTANCE_MID_WEIGHT` (down-weights mid-importance coverage) and `SCDL_FOVEATED_MIN_FLOOR_FRACTION` (lets the minimum SPP collapse when HQ is tiny), `SCDL_FOVEATED_LQ_SAMPLE_BIAS`/`SCDL_FOVEATED_LQ_MIN_SCALE` (extra throttle when the LQ footprint dominates), threshold controls `SCDL_FOVEATED_AUTO_THRESH` + `AUTO_LO_PUSH`/`AUTO_HI_PULL`/`AUTO_MASK_BIAS_GAIN` (coverage-aware percentiles/bias) alongside `SCDL_FOVEATED_MASK_BIAS`, bounce controls `SCDL_FOVEATED_MAX_BOUNCES`/`SCDL_FOVEATED_TRANSPARENT_BOUNCES` with `SCDL_FOVEATED_BOUNCE_TAPER` + `SCDL_FOVEATED_BOUNCE_FLOOR`, `SCDL_FOVEATED_LQ_DIFFUSE` (default on, uses a minimal diffuse BSDF for LQ), `SCDL_FOVEATED_LQ_REUSE_TEXTURES` (opt back to texture-heavy LQ branch), `SCDL_FOVEATED_LIGHT_TREE`, `SCDL_FOVEATED_LIGHT_SAMPLING_THRESHOLD`, and `SCDL_FOVEATED_LIGHT_THRESHOLD_BOOST` (light-tree control/culling for faster renders).
 - **System** — `SCDL_EXPECTED_GPU` (defaults to `RTX 3060`) controls which OPTIX/CUDA device the pipeline accepts.
 
 All scripts reject non-OPTIX paths (`SCDL_CYCLES_DEVICE` must be `OPTIX`) and any CPU/CUDA fallbacks.
