@@ -19,6 +19,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -35,13 +36,14 @@ try:
 except ImportError:
     INSIDE_BLENDER = False
 
-# ==========================
+# ========================== 
 # BLENDER RENDER PATH
-# ==========================
+# ========================== 
 if INSIDE_BLENDER:
     import time
     if str(PROJECT_ROOT) not in sys.path:
         sys.path.insert(0, str(PROJECT_ROOT))
+    import numpy as np
     from scdl import StageTimer, get_logger
     from scdl.logging import log_devices, log_environment
     from scdl.runtime import (
@@ -67,19 +69,60 @@ if INSIDE_BLENDER:
                 levels.append(value)
         return sorted(set(levels))
 
-    def run_blender_batch() -> None:
+    def _configure_sample_output(tree: bpy.types.NodeTree, rl_node, logger):
+        """Wire the Debug Sample Count pass to a temp EXR output."""
+
+        samples_dir = OUT_ROOT / "temp_samples"
+        samples_dir.mkdir(parents=True, exist_ok=True)
+        for leftover in samples_dir.glob("*.exr"):
+            try:
+                leftover.unlink()
+            except OSError:
+                pass
+
+        file_output_node = tree.nodes.new("CompositorNodeOutputFile")
+        file_output_node.base_path = str(samples_dir)
+        file_output_node.format.file_format = "OPEN_EXR"
+        file_output_node.format.color_depth = "32"
+        file_output_node.format.color_mode = "BW"
+
+        # Reuse the default slot to avoid Blender API quirks.
+        if not file_output_node.file_slots:
+            file_output_node.file_slots.new("Image")
+        slot = file_output_node.file_slots[0]
+        sample_prefix = "debug_samples_"
+        try:
+            slot.path = sample_prefix
+            slot.use_node_format = True
+        except Exception as exc:  # pragma: no cover - Blender specific
+            logger.error("[Batch] Could not configure sample slot path: %s", exc)
+            raise
+
+        try:
+            target_input = file_output_node.inputs[0]
+            tree.links.new(rl_node.outputs["Debug Sample Count"], target_input)
+            return samples_dir, sample_prefix
+        except Exception as exc:  # pragma: no cover - Blender specific
+            logger.error("[Batch] Could not link Sample Count pass: %s", exc)
+            raise
+
+    def run_blender_batch() -> None: 
         mode = os.getenv("SCDL_BENCHMARK_MODE", "BASELINE").upper()
         spp_list_raw = os.getenv("SCDL_BENCHMARK_SPP_LIST", "")
         if not spp_list_raw:
             print("[Batch] No SPP list provided; nothing to do.")
             return
         spp_levels = _parse_spp_list(spp_list_raw)
-
         OUT_ROOT.mkdir(parents=True, exist_ok=True)
         RENDERS_DIR.mkdir(parents=True, exist_ok=True)
-        log_file = OUT_ROOT / f"benchmark_{mode.lower()}.log"
 
-        logger = get_logger(f"scdl.benchmark.{mode.lower()}", default_path=log_file)
+        # Logging is handled by the parent process capturing stdout/stderr.
+        # We force SCDL_LOG_MODE=stdout in launch_blender, so this logger
+        # only writes to stderr, which ends up in the unified log file.
+        # The default_path is ignored by scdl.logging when mode is stdout.
+        dummy_log_path = OUT_ROOT / f"benchmark_{mode.lower()}.log"
+        logger = get_logger(f"scdl.benchmark.{mode.lower()}", default_path=dummy_log_path)
+        
         logger.info("[Batch] Starting %s benchmark batch", mode)
         logger.info("[Batch] SPP Levels: %s", spp_levels)
 
@@ -93,7 +136,36 @@ if INSIDE_BLENDER:
         scene = bpy.context.scene
         skip_mask = False
         
+        # Enable Sample Count Pass & Compositor
+        view_layer = bpy.context.window.view_layer
+        if hasattr(view_layer, "cycles"):
+            view_layer.cycles.pass_debug_sample_count = True
+        
+        scene.render.use_compositing = True
+        scene.use_nodes = True
+        tree = scene.node_tree
+        for n in tree.nodes:
+            tree.nodes.remove(n)
+            
+        rl_node = tree.nodes.new("CompositorNodeRLayers")
+        comp_node = tree.nodes.new("CompositorNodeComposite")
+        viewer_node = tree.nodes.new("CompositorNodeViewer")
+        viewer_node.name = "SCDL_Viewer"
+        
+        # Link Image -> Composite (for file output)
+        tree.links.new(rl_node.outputs["Image"], comp_node.inputs["Image"])
+        
+        # Setup File Output for Sample Count
+        samples_dir, sample_prefix = _configure_sample_output(tree, rl_node, logger)
+
+        # Keep frame numbering stable so temp EXR lookup is predictable.
+        try:
+            scene.frame_set(scene.frame_start)
+        except Exception:
+            scene.frame_current = scene.frame_start
+
         batch_times: Dict[int, float] = {}
+        batch_samples: Dict[int, float] = {}
 
         if mode == "BASELINE":
             cfg = full_render_baseline.FullRenderConfig.from_env()
@@ -117,7 +189,7 @@ if INSIDE_BLENDER:
             mask_exr = Path(os.getenv("SCDL_OUT_DIR", PROJECT_ROOT / "out")) / "user_importance_mask.exr"
             if not mask_npy.exists() or not mask_exr.exists():
                 logger.error("[Batch] Missing mask files; run the pipeline first.")
-                return
+                raise RuntimeError("Missing mask files required for foveated sweep.")
             mask_stats = step3_singlepass_foveated.mask_statistics(mask_npy, cfg)
             lo, hi, gamma = mask_stats.lo, mask_stats.hi, mask_stats.gamma
             mask_image = step3_singlepass_foveated.load_mask_image(mask_exr)
@@ -157,7 +229,7 @@ if INSIDE_BLENDER:
             )
         else:
             logger.error("[Batch] Unknown mode: %s", mode)
-            return
+            raise RuntimeError(f"Unknown mode {mode}")
 
         for spp in spp_levels:
             if spp <= 0:
@@ -172,22 +244,74 @@ if INSIDE_BLENDER:
             scene.cycles.adaptive_min_samples = min(scene.cycles.adaptive_min_samples, actual_spp)
             scene.render.filepath = str(RENDERS_DIR / f"{mode.lower()}_{spp}.png")
 
+            # Reset temp output pattern for this frame
+            # We need to ensure unique names or cleanup
+            # FileOutput node appends frame number usually.
+            
             t0 = time.time()
             bpy.ops.render.render(write_still=True)
             dt = time.time() - t0
-            logger.info("[Batch] Finished %s_%d.png in %.2fs", mode.lower(), spp, dt)
-            batch_times[spp] = dt
+            
+            total_samples_val = None
+            exr_path = None
 
-        # Write render times to sidecar JSON
+            if samples_dir and sample_prefix:
+                # Construct expected path: base_path + prefix + frame + .exr
+                frame_idx = scene.frame_current
+                if frame_idx <= 0:
+                    frame_idx = scene.frame_start
+                frame_str = f"{int(frame_idx):04d}"
+                candidate = samples_dir / f"{sample_prefix}{frame_str}.exr"
+                exr_path = candidate
+
+            try:
+                if not exr_path or not exr_path.exists():
+                    logger.error("[Batch] Expected sample file not found for %s spp at %s", spp, exr_path)
+                    raise RuntimeError(f"Missing sample EXR for spp {spp}")
+
+                s_img = bpy.data.images.load(str(exr_path))
+                arr = np.array(s_img.pixels[:], dtype=np.float32)
+                channels = getattr(s_img, "channels", 4) or 4
+                if channels > 0 and arr.size % channels == 0:
+                    arr = arr.reshape(-1, channels)
+                    samples_per_pixel = arr[:, 0]
+                else:
+                    samples_per_pixel = arr
+                max_val = float(np.max(samples_per_pixel)) if samples_per_pixel.size else 0.0
+
+                # Debug Sample Count can be normalised 0..1 against target SPP.
+                if max_val <= 1.5 and actual_spp > 1:
+                    samples_per_pixel = samples_per_pixel * float(actual_spp)
+
+                total_samples_val = float(np.sum(samples_per_pixel))
+                bpy.data.images.remove(s_img)
+                try:
+                    exr_path.unlink()
+                except OSError:
+                    pass
+            except Exception as e:
+                logger.error("[Batch] Failed to read sample stats: %s", e)
+                raise
+            if total_samples_val is None:
+                logger.error("[Batch] Sample total not computed for %s spp", spp)
+                raise RuntimeError(f"Sample total missing for spp {spp}")
+
+            samples_display = f"{total_samples_val:.1e}" if total_samples_val is not None else "n/a"
+            logger.info("[Batch] Finished %s_%d.png in %.2fs (Total Samples: %s)", mode.lower(), spp, dt, samples_display)
+            batch_times[spp] = dt
+            batch_samples[spp] = total_samples_val
+
+        # Write render times and samples to sidecar JSON
         (OUT_ROOT / f"times_{mode.lower()}.json").write_text(json.dumps(batch_times, indent=2))
+        (OUT_ROOT / f"samples_{mode.lower()}.json").write_text(json.dumps(batch_samples, indent=2))
 
     if __name__ == "__main__":
         run_blender_batch()
         sys.exit(0)
 
-# ==========================
+# ========================== 
 # ORCHESTRATOR + METRICS
-# ==========================
+# ========================== 
 import math
 import numpy as np
 from PIL import Image
@@ -216,7 +340,6 @@ def psnr(a: np.ndarray, b: np.ndarray) -> float:
         return float("inf")
     return 20.0 * math.log10(1.0 / math.sqrt(mse))
 
-
 def ssim_score(a: np.ndarray, b: np.ndarray) -> float:
     try:
         from skimage.metrics import structural_similarity
@@ -228,7 +351,6 @@ def ssim_score(a: np.ndarray, b: np.ndarray) -> float:
             score += structural_similarity(a[..., c], b[..., c], data_range=1.0)
         return score / 3.0
     return float(structural_similarity(a, b, data_range=1.0))
-
 
 def lpips_distance(a: np.ndarray, b: np.ndarray, model=None) -> float:
     import torch
@@ -257,8 +379,7 @@ def lpips_distance(a: np.ndarray, b: np.ndarray, model=None) -> float:
         raise RuntimeError("LPIPS returned a non-finite value.")
     return dist_val
 
-
-def collect_metrics(reference: Path, mode: str, spp_values: List[int], lpips_model=None, time_data: Dict[str, float] = None) -> Dict[int, Dict[str, float]]:
+def collect_metrics(reference: Path, mode: str, spp_values: List[int], lpips_model=None, time_data: Dict[str, float] = None, sample_data: Dict[str, float] = None) -> Dict[int, Dict[str, float]]:
     results: Dict[int, Dict[str, float]] = {}
     ref = load_image(reference)
 
@@ -302,9 +423,18 @@ def collect_metrics(reference: Path, mode: str, spp_values: List[int], lpips_mod
         if time_data:
             render_time = time_data.get(str(spp), float("nan"))
             
-        # Only add to results if we have at least one valid metric (visual or time)
-        if not (math.isnan(lp) and math.isnan(ssim_val) and math.isnan(psnr_val) and math.isnan(render_time)):
-            results[spp] = {"lpips": lp, "ssim": ssim_val, "psnr": psnr_val, "time": render_time}
+        total_samples = float("nan")
+        if sample_data:
+            val = sample_data.get(str(spp))
+            if val is not None:
+                try:
+                    total_samples = float(val)
+                except (TypeError, ValueError):
+                    pass
+            
+        # Only add to results if we have at least one valid metric (visual or time or samples)
+        if not (math.isnan(lp) and math.isnan(ssim_val) and math.isnan(psnr_val) and math.isnan(render_time) and math.isnan(total_samples)):
+            results[spp] = {"lpips": lp, "ssim": ssim_val, "psnr": psnr_val, "time": render_time, "samples": total_samples}
         
         # Aggressive cleanup to avoid OOM on limited VRAM
         torch.cuda.empty_cache()
@@ -356,6 +486,9 @@ def plot_curves(metrics: Dict[str, Dict[int, Dict[str, float]]], metric: str, yl
             label=label.title(),
         )
 
+    plt.xlabel("Samples Per Pixel (SPP)", fontsize=12)
+    plt.ylabel(ylabel, fontsize=12)
+    
     # Add a small margin to the X-axis limits so end points aren't clipped
     x_margin = max_x * 0.02 if max_x > 0 else 1
     plt.xlim(left=0, right=max_x + x_margin)
@@ -382,6 +515,10 @@ def plot_curves(metrics: Dict[str, Dict[int, Dict[str, float]]], metric: str, yl
     plt.close()
 
 
+def plot_sample_efficiency(metrics: Dict[str, Dict[int, Dict[str, float]]], outfile: Path) -> None:
+    # Deprecated duplicate of samples plot; intentionally left unused.
+    return None
+
 def build_spp_range(start: int, stop: int, step: int) -> List[int]:
     if start < 0:
         start = 0
@@ -389,7 +526,6 @@ def build_spp_range(start: int, stop: int, step: int) -> List[int]:
     if values and values[0] != 0:
         values.insert(0, 0)  # ensure x-axis starts at 0 even if not rendered
     return sorted(set(values))
-
 
 def load_scdl_env() -> Dict[str, str]:
     env_path = PROJECT_ROOT / ".scdl.env"
@@ -419,7 +555,6 @@ def _get_env_bool(name: str, env_file: Dict[str, str], default: bool) -> bool:
     if raw in {"0", "false", "no", "off"}:
         return False
     raise RuntimeError(f"{name} must be truthy/falsy (received '{raw}').")
-
 
 def _mask_stats_for_cap(env_file: Dict[str, str]) -> Tuple[float, float, float, float]:
     """Return coverage, hq, mid, lq fractions using the same auto-threshold logic as Step 3."""
@@ -466,7 +601,6 @@ def _mask_stats_for_cap(env_file: Dict[str, str]) -> Tuple[float, float, float, 
     coverage_mid = max(0.0, min(1.0, 1.0 - coverage_hq - coverage_lq))
     return coverage, coverage_hq, coverage_mid, coverage_lq
 
-
 def _predict_foveated_effective(env_file: Dict[str, str]) -> float:
     """Predict effective samples using the same math as Step 3 (without bpy)."""
 
@@ -506,8 +640,7 @@ def _predict_foveated_effective(env_file: Dict[str, str]) -> float:
 
     return float(effective)
 
-
-def verify_metric_dependencies() -> None:
+def verify_metric_dependencies() -> None: 
     missing: List[str] = []
     for mod in ("torch", "lpips", "skimage.metrics", "matplotlib"):
         try:
@@ -521,7 +654,6 @@ def verify_metric_dependencies() -> None:
             + ". Activate the scdl-foveated environment or install them (conda env update --file environment.yml --prune)."
         )
 
-
 def _get_env_number(name: str, env_file: Dict[str, str], *, typ: str) -> float:
     raw = os.getenv(name)
     if raw is None:
@@ -533,7 +665,6 @@ def _get_env_number(name: str, env_file: Dict[str, str], *, typ: str) -> float:
         return int(raw) if typ == "int" else float(raw)
     except ValueError as exc:
         raise RuntimeError(f"{name} must be a {typ} (received '{raw}').") from exc
-
 
 def _get_env_number_with_fallback(primary: str, fallback: str, env_file: Dict[str, str], *, typ: str) -> float:
     raw = os.getenv(primary)
@@ -551,7 +682,6 @@ def _get_env_number_with_fallback(primary: str, fallback: str, env_file: Dict[st
     except ValueError as exc:
         raise RuntimeError(f"{primary} (fallback {fallback}) must be a {typ} (received '{raw}').") from exc
 
-
 def compute_baseline_cap(env_file: Dict[str, str]) -> int:
     base = _get_env_number("SCDL_BASELINE_SPP", env_file, typ="int")
     scale_raw = os.getenv("SCDL_BASELINE_SPP_SCALE") or env_file.get("SCDL_BASELINE_SPP_SCALE") or "1.0"
@@ -564,10 +694,8 @@ def compute_baseline_cap(env_file: Dict[str, str]) -> int:
     max_spp = _get_env_number_with_fallback("SCDL_BASELINE_MAX_SPP", "SCDL_FOVEATED_MAX_SPP", env_file, typ="int")
     return max(min_spp, min(max_spp, base))
 
-
 def compute_foveated_cap(env_file: Dict[str, str]) -> int:
     return int(round(_predict_foveated_effective(env_file)))
-
 
 def prompt_val(prompt: str, default: int) -> int:
     """Ask the user for an integer input, falling back to default on empty."""
@@ -584,7 +712,6 @@ def prompt_val(prompt: str, default: int) -> int:
         except ValueError:
             print("Invalid integer. Try again.")
 
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark sweep for foveated vs baseline renders.")
     parser.add_argument("--blend", type=Path, default=None, help="Blend file to render (defaults to BLEND_FILE in .scdl.env).")
@@ -596,8 +723,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch", action="store_true", help="Run in non-interactive mode (accept defaults/args).")
     return parser.parse_args()
 
-
-def launch_blender(mode: str, spp_values: List[int], blend: Path, env_file: Dict[str, str]) -> None:
+def launch_blender(mode: str, spp_values: List[int], blend: Path, env_file: Dict[str, str]) -> None: 
     blender_exe = (
         os.getenv("SCDL_LINUX_BLENDER_EXE")
         or os.getenv("BLENDER_EXE")
@@ -625,8 +751,41 @@ def launch_blender(mode: str, spp_values: List[int], blend: Path, env_file: Dict
     if mode.upper() == "FOVEATED":
         env["SCDL_FOVEATED_AUTOSPP"] = "0"
     env["SCDL_CLEAR_OUT_DIR"] = env.get("SCDL_CLEAR_OUT_DIR", "0")
-    subprocess.run(cmd, check=True, env=env)
+    
+    # Force child process to log only to stdout, which we capture.
+    env["SCDL_LOG_MODE"] = "stdout" 
 
+    log_path = OUT_ROOT / "benchmark.log"
+    print(f"[Batch] Launching {mode} sweep... (logging to {log_path})")
+    
+    # Determine if we should also print to console based on the current environment
+    log_mode = os.getenv("SCDL_LOG_MODE", "both").lower()
+    show_output = log_mode in {"both", "stdout"}
+
+    with open(log_path, "a", encoding="utf-8") as f:
+        process = subprocess.Popen(
+            cmd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            encoding="utf-8",
+            errors="replace"
+        )
+        
+        # Tee the output: write to file and optionally to stdout
+        if process.stdout:
+            for line in process.stdout:
+                f.write(line)
+                f.flush()
+                if show_output:
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+        
+        process.wait()
+        if process.returncode != 0:
+            raise subprocess.CalledProcessError(process.returncode, cmd)
 
 def detect_max_spp(mode: str) -> int:
     """Scan the renders directory to find the highest available SPP level."""
@@ -644,8 +803,7 @@ def detect_max_spp(mode: str) -> int:
                 continue
     return max_val
 
-
-def main() -> None:
+def main() -> None: 
     args = parse_args()
 
     env_file = load_scdl_env()
@@ -664,6 +822,11 @@ def main() -> None:
 
     OUT_ROOT.mkdir(parents=True, exist_ok=True)
     RENDERS_DIR.mkdir(parents=True, exist_ok=True)
+    
+    # Initialize/Clear unified log file if starting a new run
+    log_path = OUT_ROOT / "benchmark.log"
+    if not args.no_render:
+        log_path.write_text(f"[Benchmark] Starting run at {time.ctime()}\n")
 
     baseline_cap = compute_baseline_cap(env_file)
     foveated_cap = compute_foveated_cap(env_file)
@@ -715,48 +878,26 @@ def main() -> None:
     except Exception as e:
         print(f"[Main] Warning: Could not load shared LPIPS model: {e}")
 
-    def parse_times_from_log(log_path: Path) -> Dict[str, float]:
-        """Fallback: parse render times from existing logs if JSON is missing."""
-        extracted = {}
-        if not log_path.exists():
-            return extracted
-        import re
-        # Example log line: ... [Batch] Finished baseline_2.png in 3.29s
-        pattern = re.compile(r"Finished (\w+)_(\d+)\.png in ([\d\.]+)s")
-        for line in log_path.read_text().splitlines():
-            match = pattern.search(line)
-            if match:
-                spp = match.group(2)
-                duration = float(match.group(3))
-                extracted[spp] = duration
-        return extracted
+    def load_json_required(path: Path, label: str) -> Dict[str, float]:
+        """Strictly load a non-empty JSON dict or raise."""
+        if not path.exists():
+            raise RuntimeError(f"{label} missing at {path}")
+        try:
+            data = json.loads(path.read_text())
+        except Exception as exc:
+            raise RuntimeError(f"{label} could not be parsed at {path}") from exc
+        if not isinstance(data, dict) or not data:
+            raise RuntimeError(f"{label} is empty or invalid at {path}")
+        return data
 
-    times_baseline = {}
-    times_foveated = {}
-    
-    # Try loading JSON first
-    try:
-        times_baseline = json.loads((OUT_ROOT / "times_baseline.json").read_text())
-    except Exception:
-        pass
-    
-    # Fallback to log parsing if empty (legacy runs)
-    if not times_baseline:
-        print("[Main] times_baseline.json missing, parsing log...")
-        times_baseline = parse_times_from_log(OUT_ROOT / "benchmark_baseline.log")
-
-    try:
-        times_foveated = json.loads((OUT_ROOT / "times_foveated.json").read_text())
-    except Exception:
-        pass
-        
-    if not times_foveated:
-        print("[Main] times_foveated.json missing, parsing log...")
-        times_foveated = parse_times_from_log(OUT_ROOT / "benchmark_foveated.log")
+    times_baseline = load_json_required(OUT_ROOT / "times_baseline.json", "Baseline times")
+    samples_baseline = load_json_required(OUT_ROOT / "samples_baseline.json", "Baseline samples")
+    times_foveated = load_json_required(OUT_ROOT / "times_foveated.json", "Foveated times")
+    samples_foveated = load_json_required(OUT_ROOT / "samples_foveated.json", "Foveated samples")
 
     metrics = {
-        "baseline": collect_metrics(REFERENCE_PATH, "baseline", baseline_spp, lpips_model=shared_model, time_data=times_baseline),
-        "foveated": collect_metrics(REFERENCE_PATH, "foveated", foveated_spp, lpips_model=shared_model, time_data=times_foveated),
+        "baseline": collect_metrics(REFERENCE_PATH, "baseline", baseline_spp, lpips_model=shared_model, time_data=times_baseline, sample_data=samples_baseline),
+        "foveated": collect_metrics(REFERENCE_PATH, "foveated", foveated_spp, lpips_model=shared_model, time_data=times_foveated, sample_data=samples_foveated),
     }
 
     (OUT_ROOT / "metrics.json").write_text(json.dumps(metrics, indent=2))
@@ -789,12 +930,19 @@ def main() -> None:
         "Render Performance: Time vs. SPP",
         OUT_ROOT / "time.png",
     )
+    plot_curves(
+        metrics,
+        "samples",
+        "Total Rays Fired (Sum)",
+        "Sample Efficiency: Total Rays vs. Target SPP",
+        OUT_ROOT / "samples.png",
+    )
 
     # Write markdown table
     all_spp = sorted(set(baseline_spp + foveated_spp))
     table_lines = [
-        "| SPP | Baseline Time | Baseline LPIPS | Baseline SSIM | Baseline PSNR | Foveated Time | Foveated LPIPS | Foveated SSIM | Foveated PSNR |",
-        "|-----|---------------|----------------|---------------|---------------|---------------|----------------|---------------|---------------|",
+        "| Target SPP | Baseline Time | Base Total Rays | Baseline LPIPS | Baseline SSIM | Baseline PSNR | Foveated Time | Fov Total Rays | Foveated LPIPS | Foveated SSIM | Foveated PSNR |",
+        "|------------|---------------|-----------------|----------------|---------------|---------------|---------------|----------------|----------------|---------------|---------------|",
     ]
     for spp in all_spp:
         b = metrics["baseline"].get(spp)
@@ -805,14 +953,18 @@ def main() -> None:
             val = entry.get(key)
             if val is None or (isinstance(val, float) and (val != val)):
                 return "N/A"
+            if key == "samples":
+                return f"{val:.2e}" # Scientific notation for huge numbers
             return f"{val:.4f}"
         row = [
             str(spp),
             fmt(b, "time"),
+            fmt(b, "samples"),
             fmt(b, "lpips"),
             fmt(b, "ssim"),
             fmt(b, "psnr"),
             fmt(f, "time"),
+            fmt(f, "samples"),
             fmt(f, "lpips"),
             fmt(f, "ssim"),
             fmt(f, "psnr"),
@@ -825,31 +977,27 @@ def main() -> None:
 
 
 def write_unified_log(baseline_spp: List[int], foveated_spp: List[int]) -> None:
-    """Emit a single consolidated log combining render logs and metrics locations."""
+    """Emit a summary footer to the unified log."""
 
-    run_log = OUT_ROOT / "benchmark_run.log"
-    baseline_log = OUT_ROOT / "benchmark_baseline.log"
-    foveated_log = OUT_ROOT / "benchmark_foveated.log"
+    log_path = OUT_ROOT / "benchmark.log"
+    
+    lines = [
+        f"\n[Sweep] ===== Benchmark Complete =====",
+        f"[Sweep] Baseline SPP levels: {','.join(map(str, baseline_spp))}",
+        f"[Sweep] Foveated SPP levels: {','.join(map(str, foveated_spp))}",
+        f"[Sweep] Metrics: {OUT_ROOT / 'metrics.json'}",
+        f"[Sweep] Table: {OUT_ROOT / 'benchmark_results.md'}",
+        f"[Sweep] Plots: {OUT_ROOT / 'lpips.png'}\n",
+    ]
+    
+    log_mode = os.getenv("SCDL_LOG_MODE", "both").lower()
+    show_output = log_mode in {"both", "stdout"}
 
-    lines: List[str] = []
-    lines.append("[Sweep] Baseline SPP levels: " + ",".join(map(str, baseline_spp)))
-    lines.append("[Sweep] Foveated SPP levels: " + ",".join(map(str, foveated_spp)))
-    lines.append(f"[Sweep] Metrics: {OUT_ROOT / 'metrics.json'}")
-    lines.append(f"[Sweep] Table: {OUT_ROOT / 'benchmark_results.md'}")
-    lines.append(f"[Sweep] Plots: {OUT_ROOT / 'lpips.png'}, {OUT_ROOT / 'ssim.png'}, {OUT_ROOT / 'psnr.png'}, {OUT_ROOT / 'time.png'}")
-
-    def append_file(tag: str, path: Path) -> None:
-        if not path.exists():
-            lines.append(f"[Sweep] {tag} log missing: {path}")
-            return
-        lines.append(f"[Sweep] ===== Begin {tag} log ({path}) =====")
-        lines.extend(path.read_text().splitlines())
-        lines.append(f"[Sweep] ===== End {tag} log =====")
-
-    append_file("baseline", baseline_log)
-    append_file("foveated", foveated_log)
-
-    run_log.write_text("\n".join(lines))
+    with open(log_path, "a", encoding="utf-8") as f:
+        for line in lines:
+            f.write(line + "\n")
+            if show_output:
+                print(line)
 
 
 if __name__ == "__main__" and not INSIDE_BLENDER:

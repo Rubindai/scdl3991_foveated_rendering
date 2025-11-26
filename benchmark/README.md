@@ -14,6 +14,7 @@ This:
 - Uses your settings to derive the end of each curve (baseline cap = clamped `SCDL_BASELINE_SPP`, foveated cap = clamped `SCDL_FOVEATED_BASE_SPP`; both start at 0, and any SPP above the cap is skipped).
 - Renders both modes at the requested SPP levels (skipping levels above each mode’s effective cap).
 - Forces foveated sweeps to use exact SPP counts (`SCDL_FOVEATED_AUTOSPP=0`) for clean x-axis control.
+- Captures the actual rays fired per level using the Cycles Debug Sample Count pass, writing `samples_baseline.json` / `samples_foveated.json` and plotting `samples.png`.
 - Computes LPIPS/SSIM/PSNR against `out_full_render/final.png`.
 - Writes results to `benchmark_sweep_out/metrics.json` and plots `lpips.png`, `ssim.png`, `psnr.png` in the same directory.
 
